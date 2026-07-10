@@ -24,17 +24,19 @@ CREATE TABLE IF NOT EXISTS callyzer_calls (
     call_timestamp      TEXT NOT NULL,      -- ISO 8601, parsed from export
     direction            TEXT,               -- 'incoming' / 'outgoing'
     duration_seconds     INTEGER,
-    connected            INTEGER,            -- 1 if duration > 45s, else 0
+    connected            INTEGER,            -- 1 if duration > 0s, else 0
     rep_name             TEXT,
     rep_sim_number       TEXT,               -- company SIM, most reliable rep key
     customer_number_raw  TEXT,
-    customer_number_norm TEXT,               -- normalized 10-digit
+    customer_number_norm TEXT,               -- normalized 10-digit mobile, NULL for landlines
+    call_uid             TEXT,               -- Callyzer's own per-call UniqueId; authoritative de-dup key
     source_file          TEXT NOT NULL,
-    row_hash             TEXT NOT NULL UNIQUE, -- de-dup guard, see ingest script
+    row_hash             TEXT NOT NULL UNIQUE, -- de-dup guard = call_uid when present, else composite hash
     ingested_at          TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_calls_customer ON callyzer_calls(customer_number_norm);
+CREATE INDEX IF NOT EXISTS idx_calls_uid ON callyzer_calls(call_uid);
 CREATE INDEX IF NOT EXISTS idx_calls_rep ON callyzer_calls(rep_sim_number);
 CREATE INDEX IF NOT EXISTS idx_calls_timestamp ON callyzer_calls(call_timestamp);
 

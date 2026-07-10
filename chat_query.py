@@ -88,7 +88,7 @@ MAX_RESULT_ROWS = 200          # never read more than this into memory
 MAX_ROWS_TO_SUMMARIZE = 40     # rows actually shown to the model
 QUERY_TIMEOUT_SECONDS = 10     # abort runaway queries
 MAX_SQL_ATTEMPTS = 3           # self-correction attempts on SQL errors
-HISTORY_TURNS_TO_INCLUDE = 12  # prior Q&A pairs replayed as context
+HISTORY_TURNS_TO_INCLUDE = 16  # prior Q&A pairs replayed as context
 API_MAX_RETRIES = 4            # retries on rate limit / transient server error
 
 # Every provider below exposes an OpenAI-compatible /chat/completions
@@ -196,9 +196,16 @@ HIDDEN_TABLES = {"sqlite_sequence", "chat_history"}
 # Extra human context for tables whose meaning isn't obvious from column
 # names alone. Anything not listed still gets its columns introspected.
 TABLE_NOTES = {
-    "callyzer_calls": "One row per phone call. connected=1 means duration_seconds > 45. "
-                      "direction is 'incoming' or 'outgoing'. rep_sim_number is the most "
-                      "reliable way to identify a rep (names have spelling variants).",
+    "callyzer_calls": "One row per phone call = one call attempt. To count 'calls made/attempted', "
+                      "use COUNT(*) with NO filter on customer_number_norm — every row is a real call. "
+                      "customer_number_norm is NULL for landline/non-mobile numbers (e.g. Mumbai '22...' "
+                      "landlines); those are still real calls and must be counted, they just can't be "
+                      "joined to a customer/order by phone. call_uid is Callyzer's unique per-call id "
+                      "(each row is already distinct — do not COUNT(DISTINCT) to de-duplicate). "
+                      "duration_seconds comes from the export's Duration column. connected=1 means "
+                      "duration_seconds > 0, while a valid connection means duration_seconds > 45. "
+                      "direction is 'incoming' or 'outgoing'. rep_sim_number is the most reliable way "
+                      "to identify a rep (names have spelling variants).",
     "callyzer_leads": "One row per lead, reflecting its CURRENT state, not history. "
                       "tags may contain 'IndiaMart Lead' or 'Gold Lead'. assigned_to is a rep name.",
     "shopify_orders": "One row per Shopify order. rep_attribution may be NULL — salesperson "
@@ -244,14 +251,18 @@ def build_schema_description():
         "column — always join and filter on the *_norm columns, never the *_raw ones."
     )
     lines.append(
-        "For relative dates ('today', 'yesterday', 'this week', 'last 3 days'), use "
-        "SQLite date functions such as date('now'), date('now','-1 day'), "
-        "date('now','-7 days'). Do NOT write a hardcoded date literal for these — "
-        "you do not reliably know today's date, but SQLite does."
+        "call_timestamp is stored in LOCAL India time (IST), as ISO 8601 text. "
+        "For relative dates ('today', 'yesterday', 'this week', 'last 3 days'), you "
+        "MUST use SQLite's localtime modifier so the comparison is also in IST: "
+        "date('now','localtime'), date('now','localtime','-1 day'), "
+        "date('now','localtime','-7 days'). NEVER use bare date('now') (that is UTC "
+        "and is wrong before ~5:30am IST), and never hardcode a date literal — you do "
+        "not reliably know today's date, but SQLite does."
     )
     lines.append(
-        "call_timestamp is ISO 8601 text, so date(call_timestamp) gives its date. "
-        "Prefer COUNT(*) / SUM() / AVG() in SQL over returning many rows."
+        "date(call_timestamp) gives a call's IST date, so compare it against "
+        "date('now','localtime'). Prefer COUNT(*) / SUM() / AVG() in SQL over "
+        "returning many rows."
     )
     return "\n".join(lines)
 

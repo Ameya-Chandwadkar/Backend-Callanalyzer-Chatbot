@@ -51,6 +51,7 @@ CALL_HEADER_ALIASES = {
     "rep_name": ["employee name", "employee", "agent", "rep name"],
     "rep_sim": ["employee number", "sim number", "sim", "agent number"],
     "customer_number": ["to number", "customer number", "phone number", "contact number"],
+    "call_uid": ["uniqueid", "unique id", "call id", "callid", "call unique id"],
 }
 
 LEAD_HEADER_ALIASES = {
@@ -106,6 +107,55 @@ def _parse_timestamp(raw):
     return None  # unparseable -> caller flags the row
 
 
+def _parse_duration_seconds(raw):
+    if raw is None:
+        return 0
+    text = str(raw).strip().lower()
+    if not text:
+        return 0
+
+    try:
+        return int(float(text))
+    except ValueError:
+        pass
+
+    # Formats seen in exports: "0h 0m 47s", "1m 12s", "47s", "00:01:12".
+    if ":" in text:
+        parts = []
+        for part in text.split(":"):
+            part = part.strip()
+            if not part:
+                return 0
+            try:
+                parts.append(int(float(part)))
+            except ValueError:
+                return 0
+        if len(parts) == 3:
+            h, m, s = parts
+            return h * 3600 + m * 60 + s
+        if len(parts) == 2:
+            m, s = parts
+            return m * 60 + s
+        if len(parts) == 1:
+            return parts[0]
+        return 0
+
+    import re
+
+    hours = minutes = seconds = 0
+    mh = re.search(r"(\d+)\s*h", text)
+    mm = re.search(r"(\d+)\s*m", text)
+    ms = re.search(r"(\d+)\s*s", text)
+    if mh:
+        hours = int(mh.group(1))
+    if mm:
+        minutes = int(mm.group(1))
+    if ms:
+        seconds = int(ms.group(1))
+    total = hours * 3600 + minutes * 60 + seconds
+    return total
+
+
 def _build_timestamp_raw(raw_row, headers):
     """
     Callyzer's export has been seen in two shapes: a single combined
@@ -129,43 +179,75 @@ def _build_timestamp_raw(raw_row, headers):
 
 def ingest_calls(conn, path, reader, headers):
     log_id = start_log(conn, "callyzer_calls", os.path.basename(path))
-    read = inserted = duplicate = flagged = 0
+    read = inserted = updated = duplicate = flagged = 0
 
     for raw_row in reader:
         read += 1
         ts = _parse_timestamp(_build_timestamp_raw(raw_row, headers))
         cust_raw = raw_row.get(headers.get("customer_number"), "")
+        # A landline (e.g. a Mumbai "22…" number) is a REAL call that was
+        # made — it just can't be normalized to a 10-digit mobile, so it
+        # won't join to a customer by phone. We still store it (norm=NULL)
+        # so call-volume counts stay accurate. Only a genuinely unusable
+        # row — one we can't even place in time — is flagged and skipped.
         cust_norm = normalize_phone(cust_raw)
 
         if ts is None:
             flagged += 1
             flag_row(conn, log_id, "unparseable call timestamp", raw_row)
             continue
-        if cust_norm is None:
-            flagged += 1
-            flag_row(conn, log_id, "unresolvable customer number", raw_row)
-            continue
 
         duration_raw = raw_row.get(headers.get("duration"), "0")
-        try:
-            duration = int(float(str(duration_raw).strip() or 0))
-        except ValueError:
-            duration = 0
+        duration = _parse_duration_seconds(duration_raw)
 
         direction = (raw_row.get(headers.get("direction"), "") or "").strip().lower()
         rep_name = (raw_row.get(headers.get("rep_name"), "") or "").strip()
         rep_sim = (raw_row.get(headers.get("rep_sim"), "") or "").strip()
+        call_uid = (raw_row.get(headers.get("call_uid"), "") or "").strip()
 
-        h = row_hash(ts, cust_norm, rep_sim, duration, direction)
+        # Callyzer stamps every call with a UniqueId — the authoritative
+        # de-dup key. Two calls to the same number in the same minute are
+        # distinct rows with distinct UniqueIds, so keying on the uid (not
+        # a timestamp-to-the-minute composite) stops us from silently
+        # collapsing genuine re-dials. Fall back to a composite hash only
+        # for the rare export that lacks a uid.
+        h = call_uid if call_uid else row_hash(ts, cust_norm, rep_sim, direction, cust_raw)
+
+        existing = conn.execute(
+            "SELECT call_id FROM callyzer_calls WHERE row_hash = ?", (h,)
+        ).fetchone()
+
+        if existing:
+            conn.execute(
+                """UPDATE callyzer_calls
+                   SET call_timestamp = ?,
+                       direction = ?,
+                       duration_seconds = ?,
+                       connected = ?,
+                       rep_name = ?,
+                       rep_sim_number = ?,
+                       customer_number_raw = ?,
+                       customer_number_norm = ?,
+                       call_uid = ?,
+                       source_file = ?,
+                       ingested_at = ?
+                   WHERE call_id = ?""",
+                (ts, direction, duration, 1 if duration > 0 else 0,
+                 rep_name, rep_sim, cust_raw, cust_norm, call_uid or None,
+                 os.path.basename(path), now_iso(), existing["call_id"]),
+            )
+            duplicate += 1
+            continue
+
         try:
             conn.execute(
                 """INSERT INTO callyzer_calls
                    (call_timestamp, direction, duration_seconds, connected,
                     rep_name, rep_sim_number, customer_number_raw,
-                    customer_number_norm, source_file, row_hash, ingested_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (ts, direction, duration, 1 if duration > 45 else 0,
-                 rep_name, rep_sim, cust_raw, cust_norm,
+                    customer_number_norm, call_uid, source_file, row_hash, ingested_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (ts, direction, duration, 1 if duration > 0 else 0,
+                 rep_name, rep_sim, cust_raw, cust_norm, call_uid or None,
                  os.path.basename(path), h, now_iso()),
             )
             inserted += 1
@@ -173,7 +255,7 @@ def ingest_calls(conn, path, reader, headers):
             duplicate += 1
 
     conn.commit()
-    finish_log(conn, log_id, read, inserted, 0, flagged, duplicate)
+    finish_log(conn, log_id, read, inserted, updated, flagged, duplicate)
     return read, inserted, flagged, duplicate
 
 
