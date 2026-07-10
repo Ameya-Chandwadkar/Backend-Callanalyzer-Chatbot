@@ -127,6 +127,19 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_synced_at TEXT
 );
 
+-- Every question asked through chat_query.py / chat_web.py, with the SQL
+-- used and the answer given. This is what lets the assistant understand
+-- follow-up questions ("and what about Suman?") and gives you a
+-- permanent log of what's been asked, independent of any one browser
+-- session or server restart.
+CREATE TABLE IF NOT EXISTS chat_history (
+    turn_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    question      TEXT NOT NULL,
+    sql_used       TEXT,
+    answer          TEXT,
+    asked_at         TEXT NOT NULL
+);
+
 -- ─────────────────────────────────────────────
 -- DERIVED VIEW — the join Callyzer <> Shopify
 -- ─────────────────────────────────────────────

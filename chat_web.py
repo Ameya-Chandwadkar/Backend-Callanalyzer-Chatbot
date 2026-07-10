@@ -265,6 +265,23 @@ async function ask() {
 input.addEventListener('keydown', function(e) {
   if (e.key === 'Enter') ask();
 });
+
+async function loadHistory() {
+  try {
+    const resp = await fetch('/history');
+    const data = await resp.json();
+    if (data.history && data.history.length > 0) {
+      examples.style.display = 'none';
+      for (const turn of data.history) {
+        addRow(turn.question, 'user');
+        addRow(turn.answer, 'assistant');
+      }
+    }
+  } catch (e) {
+    // if history can't load, just start with a blank conversation
+  }
+}
+loadHistory();
 </script>
 </body>
 </html>
@@ -280,6 +297,14 @@ class Handler(BaseHTTPRequestHandler):
             body = PAGE_HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/history":
+            history = chat_query.get_recent_history(limit=20)
+            body = json.dumps({"history": history}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -309,12 +334,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    if not chat_query.API_KEY:
-        print("WARNING: GROQ_API_KEY not set in .env — questions will fail until it's added.")
+    if not chat_query.PRIMARY.configured:
+        print(f"WARNING: {chat_query.PRIMARY.key_env} is not set in .env — questions "
+              f"will fail until it's added. Get a free key from "
+              f"{chat_query.PRIMARY.signup}.")
 
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     url = f"http://127.0.0.1:{PORT}"
     print(f"MasonMart Data Assistant running at {url}")
+    print(f"Using {chat_query.PRIMARY.name} ({chat_query.PRIMARY.model})")
     print("Leave this window open. Close it to stop the assistant.")
     threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     server.serve_forever()

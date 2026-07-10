@@ -97,19 +97,29 @@ def get_access_token():
         )
     return resp.json()["access_token"]
 
-# Change this if MasonMart's order-to-rep attribution lives somewhere
-# specific once that convention is decided (e.g. a line item property,
-# an order tag like "rep:sara", or a custom metafield). Left generic here
-# per PRD Out of Scope: attribution *logic* is a Phase-later decision.
+# MasonMart stores salesperson attribution in a Shopify order metafield
+# named "Salesperson Name" (confirmed by the person, not guessed) — the
+# namespace varies by how it was created, so we match on the key text
+# case-insensitively regardless of namespace. Tags/note-attribute checks
+# are kept as a fallback in case attribution conventions change later.
 def _extract_rep_attribution(order):
+    for edge in (order.get("metafields") or {}).get("edges", []):
+        node = edge.get("node", {})
+        key = (node.get("key") or "").strip().lower()
+        if key in ("salesperson name", "salesperson_name", "salesperson"):
+            value = (node.get("value") or "").strip()
+            if value:
+                return value
+
     for tag in (order.get("tags") or "").split(","):
         tag = tag.strip()
         if tag.lower().startswith("rep:"):
             return tag.split(":", 1)[1].strip()
-    note_attrs = order.get("note_attributes") or []
-    for attr in note_attrs:
-        if attr.get("name", "").lower() in ("rep", "salesperson", "attributed_to"):
+
+    for attr in (order.get("customAttributes") or []):
+        if attr.get("key", "").lower() in ("rep", "salesperson", "attributed_to", "salesperson name"):
             return attr.get("value")
+
     return None
 
 
@@ -144,6 +154,9 @@ query($cursor: String, $queryFilter: String) {
         customer { id firstName lastName phone }
         billingAddress { phone }
         customAttributes { key value }
+        metafields(first: 20) {
+          edges { node { namespace key value } }
+        }
       }
     }
   }
@@ -182,11 +195,10 @@ def upsert_order(conn, log_id, node):
     customer_name = " ".join(filter(None, [customer.get("firstName"), customer.get("lastName")])).strip()
 
     order = {
-        "tags": node.get("tags", []),
-        "note_attributes": [{"name": a["key"], "value": a["value"]}
-                             for a in (node.get("customAttributes") or [])],
+        "tags": ",".join(node.get("tags", [])),
+        "customAttributes": node.get("customAttributes") or [],
+        "metafields": node.get("metafields") or {"edges": []},
     }
-    order["tags"] = ",".join(node.get("tags", []))
 
     conn.execute(
         """INSERT INTO shopify_orders

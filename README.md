@@ -19,9 +19,10 @@ masonmart_integration/
 
 No cloud hosting, no server, no monthly infrastructure cost. Everything
 runs as local scripts on your machine (same pattern as your existing
-`clarity_report.py` setup), scheduled via Windows Task Scheduler. The only
-running cost is the Anthropic API calls made by `chat_query.py` when you
-ask it a question — a few cents each.
+`clarity_report.py` setup), scheduled via Windows Task Scheduler. Cerebras's
+free tier (no credit card, no data-sharing trade-off) comfortably
+covers `chat_query.py`'s usage at this volume, so there's no expected
+running cost at all — ingestion is free too.
 
 ## Why this design, in plain terms
 
@@ -65,23 +66,54 @@ fill in the real values. Two separate credentials are needed, for two
 separate scripts:
 
 #### Shopify (needed for `ingest_shopify.py`)
-1. In your Shopify admin (masonmart.in backend), go to
-   **Settings → Apps and sales channels → Develop apps**.
-2. Click **Create an app**, name it something like "MasonMart Data Sync."
-3. Under **Configuration → Admin API scopes**, enable:
-   - `read_orders`
-   - `read_customers`
-4. Click **Install app**, then go to the **API credentials** tab and
-   reveal the **Admin API access token**. This is a one-time reveal —
-   copy it immediately into `.env` as `SHOPIFY_ACCESS_TOKEN`.
-5. `SHOPIFY_STORE_DOMAIN` is your `*.myshopify.com` domain, found on the
-   same settings page (not your custom masonmart.in domain).
+As of January 2026, Shopify retired the old flow where a custom app gave
+you a single reveal-once access token in the admin UI. Every new app now
+goes through the **Dev Dashboard** (dev.shopify.com), and authenticates
+using a **Client ID + Client secret** instead of a static token. This is
+actually simpler to automate once set up — the script fetches a fresh
+token every run rather than you managing a token by hand.
 
-#### Anthropic API key (needed only for `chat_query.py`)
-1. Go to console.anthropic.com → API Keys → Create Key.
-2. Copy it into `.env` as `ANTHROPIC_API_KEY`.
-3. This is billed separately from your claude.ai subscription — it's
-   pay-per-use, typically a few rupees per week at this volume.
+1. In your Shopify admin: **Settings → Apps and sales channels → Develop
+   apps → Build apps using Dev Dashboard**. This opens dev.shopify.com.
+2. Click **Create app**, name it `MasonMart Data Sync`, click **Create**.
+3. Go to **Versions → Create version**:
+   - App URL: `https://shopify.dev/apps/default-app-home` (placeholder —
+     this app isn't embedded in admin, so the URL itself doesn't matter)
+   - Scopes: tick `read_orders` and `read_customers`
+   - Click **Release**
+4. Install the app on your store (there's an **Install** action on the
+   app's page in the Dev Dashboard once a version is released).
+5. Go to the app's **Settings** tab (this is the current equivalent of
+   the old "Configuration" page) and copy the **Client ID** and
+   **Client secret** into `.env` as `SHOPIFY_CLIENT_ID` and
+   `SHOPIFY_CLIENT_SECRET`.
+6. `SHOPIFY_STORE_DOMAIN` is your `*.myshopify.com` domain (not your
+   custom masonmart.in domain) — visible in the Dev Dashboard or your
+   admin URL bar.
+
+This client-credentials approach only works because MasonMart's app and
+MasonMart's store are in the same Shopify organization — i.e. you're
+building this for your own store, not distributing an app to other
+merchants. That's exactly this script's situation, so no further
+authorization step (redirect URLs, install screens for end users) is
+needed beyond step 4 above.
+
+#### Cerebras API key (needed only for `chat_query.py`)
+1. Go to cloud.cerebras.ai and sign up (email or Google/GitHub login —
+   no credit card required, Free tier).
+2. Go to **API Keys → Get API Key**.
+3. Copy it into `.env` as `CEREBRAS_API_KEY`.
+4. Optionally set `CEREBRAS_MODEL` in `.env` too (defaults to
+   `gpt-oss-120b` — Cerebras's own recommended replacement for the
+   deprecated `llama-3.3-70b`/`llama3.1-70b`, and a larger, more capable
+   model than the 17B-active Llama 4 Scout, so this is a step up rather
+   than a downgrade from what you had on Groq).
+5. Cerebras's free tier (30 requests/min, 60,000 tokens/min, 1,000,000
+   tokens/day, no card, same model family as before) comfortably covers
+   this workload with a lot more headroom than Groq's free tier had —
+   each question makes two API calls, so even 100 questions in a day is a
+   small fraction of the daily allowance. No cost expected at this
+   volume.
 
 ### 5. Phase 1 — Callyzer ingestion (start here)
 No credentials needed for this phase — it works from files you already
