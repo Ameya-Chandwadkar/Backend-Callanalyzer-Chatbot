@@ -51,15 +51,38 @@ Once ingested, callback recovery ("missed call, but a later outgoing call
 to the same number exists") is computed automatically via `v_never_attended_final`
 — it's a live join against `callyzer_calls`, so it can never go stale.
 
-### 3. Customer → salesperson mapping — manual for now
+### 3. Customer → salesperson mapping — two accepted sources
 
 `shopify_orders.rep_attribution` is 0% populated (checked directly) — there
-is no live Shopify field to pull this from yet. Edit
-`payroll/customer_salesperson_map.csv` (delete the EXAMPLE row, add real
-rows: customer name, phone, salesperson), then:
+is no live Shopify field to pull this from yet. `payroll/ingest_customer_map.py`
+auto-detects which of two formats you give it:
+
+**a) Manual mapping** — edit `payroll/customer_salesperson_map.csv` (delete
+the EXAMPLE row, add real rows: customer name, phone, salesperson). Highest
+confidence — someone explicitly said "this customer belongs to this rep."
+Stored with `source='manual_csv'`.
+
+**b) A Callyzer Lead Data Report export**, used as-is — no reformatting
+needed. Confirmed 2026-07-14 against a real 4,085-row export: it has real,
+populated `Assign To` data. Stored with `source='lead_assignment'`.
+
+⚠️ **Caveat on (b), read before trusting it for a real payout:** this tells
+you who a *lead* was assigned to, not who actually closed that customer.
+The real export sampled was still mostly mid-pipeline ("Ringing", "Cold
+Lead", "Remove" — not "Converted"). It's a reasonable proxy (probably
+exactly how the original June audit's Customer Export was built), but it's
+not verified the way a manual mapping is — the UI tags these two sources
+differently for exactly this reason. Where the same phone number appears
+assigned to more than one rep across the file (~1.2% of a real sample), the
+most recent `Assigned Date` wins and the count of resolved conflicts is
+reported — review those if the numbers look off. In practice the blast
+radius is usually small: check how many mapped phone numbers actually have
+Shopify orders (`SELECT COUNT(DISTINCT m.customer_phone_norm) FROM
+customer_salesperson_map m JOIN shopify_orders o ON o.customer_phone_norm =
+m.customer_phone_norm`) — only *those* rows affect a real payout.
 
 ```
-python payroll/ingest_customer_map.py
+python payroll/ingest_customer_map.py [path/to/file.csv]
 ```
 
 This is deliberately a *different* source from the chat's `v_order_attribution`

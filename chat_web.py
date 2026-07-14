@@ -2,10 +2,14 @@
 chat_web.py
 Local web interface for MasonMart Data Assistant.
 
-Two sections on one page:
+Three sections on one page:
   1. Live Dashboard — employee-wise stats for the last 7 days, computed
      directly in SQLite (no LLM, exact numbers, loads fast).
   2. Chat — the natural language interface over the same data.
+  3. Payroll — drop the payroll-specific reports (Never Attended Report,
+     customer-salesperson mapping), generate the combined audit/salary
+     .xlsx, and download past reports. See payroll/README.md for what
+     each input is and why some sections stay gated until provided.
 
 The /dashboard endpoint returns JSON so the browser can refresh the
 stats independently without reloading the whole page.
@@ -23,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import chat_query
 from common import get_connection, now_iso
 import ingest_callyzer
+from payroll import ingest_never_attended, ingest_customer_map, generate_report as payroll_report
 
 PORT = 5050
 
@@ -139,6 +144,16 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .target-edit { color: #2563eb; text-decoration: none; font-size: 11px; }
   .target-edit:hover { text-decoration: underline; }
 
+  /* Payroll */
+  .payroll-status-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid #f1f5f9; flex-wrap: wrap; }
+  .payroll-status-row:last-child { border-bottom: none; }
+  .channel-tag { font-size: 11px; color: #475569; background: #f1f5f9; border-radius: 10px; padding: 2px 9px; white-space: nowrap; }
+  .report-row { display: flex; align-items: center; gap: 14px; padding: 8px 0; border-bottom: 1px solid #f1f5f9; }
+  .report-row:last-child { border-bottom: none; }
+  #generate-btn { background: #2563eb; color: #fff; border: none; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; }
+  #generate-btn:hover { background: #1d4ed8; }
+  #generate-btn:disabled { opacity: 0.6; cursor: default; }
+
   /* Loading / error */
   .loading { text-align: center; padding: 48px; color: #94a3b8; font-size: 14px; }
   .error-note { background: #fff7ed; border: 1px solid #fed7aa; border-radius: 8px;
@@ -224,6 +239,7 @@ PAGE_HTML = r"""<!DOCTYPE html>
 <div class="tabs">
   <div class="tab active" onclick="switchTab('dashboard')">📊 Dashboard</div>
   <div class="tab" onclick="switchTab('chat')">💬 Chat</div>
+  <div class="tab" onclick="switchTab('payroll')">🧾 Payroll</div>
 </div>
 
 <!-- DASHBOARD PANEL -->
@@ -261,13 +277,20 @@ PAGE_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- PAYROLL PANEL -->
+<div id="payroll-panel" class="panel">
+  <div id="payroll-content" class="loading">Loading payroll status…</div>
+</div>
+
 <script>
 // ─── Tabs ───────────────────────────────────────────────
 function switchTab(name) {
-  document.querySelectorAll('.tab').forEach((t,i) => t.classList.toggle('active', ['dashboard','chat'][i]===name));
+  document.querySelectorAll('.tab').forEach((t,i) => t.classList.toggle('active', ['dashboard','chat','payroll'][i]===name));
   document.getElementById('dashboard-panel').classList.toggle('active', name==='dashboard');
   document.getElementById('chat-panel').classList.toggle('active', name==='chat');
+  document.getElementById('payroll-panel').classList.toggle('active', name==='payroll');
   if (name==='chat') document.getElementById('question').focus();
+  if (name==='payroll') { payrollFlash = null; loadPayroll(); }
 }
 
 // ─── Dashboard ──────────────────────────────────────────
@@ -508,6 +531,155 @@ async function uploadCallyzerFile(file) {
   } finally {
     setUploadBusy(false);
   }
+}
+
+// ─── Payroll ────────────────────────────────────────────
+// Survives the full-panel re-render that loadPayroll() does, so an upload
+// or generate result stays on screen instead of flashing away. {ok, text}.
+let payrollFlash = null;
+
+async function loadPayroll() {
+  const el = document.getElementById('payroll-content');
+  el.innerHTML = '<div class="loading">Loading payroll status…</div>';
+  try {
+    const resp = await fetch('/payroll/status');
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+    renderPayroll(data);
+  } catch (e) {
+    el.innerHTML = `<div class="error-note">Could not load payroll status: ${e}</div>`;
+  }
+}
+
+function renderPayroll(d) {
+  const inputs = d.inputs || [];
+  let flashHtml = '';
+  if (payrollFlash) {
+    const bg = payrollFlash.ok ? '#dcfce7' : '#fee2e2';
+    const bd = payrollFlash.ok ? '#86efac' : '#fca5a5';
+    const fg = payrollFlash.ok ? '#166534' : '#991b1b';
+    const icon = payrollFlash.ok ? '✓' : '✕';
+    flashHtml = `<div style="background:${bg};border:1px solid ${bd};color:${fg};border-radius:8px;padding:12px 14px;margin-bottom:14px;font-size:13px;display:flex;gap:8px;align-items:flex-start">
+      <span style="font-weight:700">${icon}</span><span>${payrollFlash.text}</span>
+    </div>`;
+  }
+  const channelTag = {
+    chat: 'Chat tab upload', payroll: 'drop below', api: 'Shopify auto-sync',
+    config: 'payroll_config.json', derived: 'auto-derived',
+  };
+  function inputRow(r) {
+    return `
+      <div class="payroll-status-row">
+        <span class="badge ${r.satisfied ? 'high' : 'low'}">${r.satisfied ? 'Ready' : 'Needed'}</span>
+        <strong>${r.name}</strong>
+        <span class="channel-tag">${channelTag[r.channel] || r.channel}</span>
+        <span class="target-sub">${r.detail}</span>
+      </div>`;
+  }
+  const perfRows = inputs.filter(r => r.group === 'Performance').map(inputRow).join('');
+  const salaryRows = inputs.filter(r => r.group === 'Salary').map(inputRow).join('');
+  const readyCount = inputs.filter(r => r.satisfied).length;
+
+  const reportsHtml = d.reports.length ? d.reports.map(r => `
+    <div class="report-row">
+      <span>${r.name}</span>
+      <span class="target-sub">${r.generated_at} · ${r.size_kb} KB</span>
+      <a href="/payroll/download/${encodeURIComponent(r.name)}" class="secondary-btn" style="text-decoration:none;display:inline-block;padding:6px 14px;">Download</a>
+    </div>`).join('') : '<div class="target-sub">No reports generated yet.</div>';
+
+  document.getElementById('payroll-content').innerHTML = `
+    ${flashHtml}
+    <div class="section-title">Payroll / Combined Audit Report</div>
+    <div class="freshness-note">Mirrors MasonMart_Combined_Audit_Salary_Jun2026.xlsx — the 7 inputs below are exactly what that report was built from. ${readyCount} of ${inputs.length} ready.</div>
+
+    <div class="section-title" style="margin-top:20px">Performance Inputs</div>
+    <div class="table-wrap" style="padding:16px">${perfRows}</div>
+    <div class="section-title" style="margin-top:16px">Salary Inputs</div>
+    <div class="table-wrap" style="padding:16px">${salaryRows}</div>
+
+    <div class="section-title" style="margin-top:20px">Drop Reports</div>
+    <div class="upload-card" id="na-upload-card" ondragover="handlePayrollDragOver(event,'na')" ondragleave="handlePayrollDragLeave(event,'na')" ondrop="handlePayrollDrop(event,'na')">
+      <div class="upload-copy">
+        <strong>Never Attended Report</strong>
+        <span>Drop the Callyzer "Never Attended Report" CSV export here.</span>
+      </div>
+      <div class="upload-actions">
+        <input type="file" id="na-input" accept=".csv,text/csv" style="display:none" onchange="handlePayrollInputChange(event,'na')">
+        <button class="secondary-btn" onclick="document.getElementById('na-input').click()">Choose CSV</button>
+        <div class="upload-status" id="na-status"></div>
+      </div>
+    </div>
+    <div class="upload-card" id="cm-upload-card" ondragover="handlePayrollDragOver(event,'cm')" ondragleave="handlePayrollDragLeave(event,'cm')" ondrop="handlePayrollDrop(event,'cm')">
+      <div class="upload-copy">
+        <strong>Customer → Salesperson Mapping</strong>
+        <span>Drop a CSV with columns Customer Name / Customer Phone / Salesperson, OR a Callyzer Lead Data Report export (uses its Assign To field — see payroll/README.md for the caveat on that source).</span>
+      </div>
+      <div class="upload-actions">
+        <input type="file" id="cm-input" accept=".csv,text/csv" style="display:none" onchange="handlePayrollInputChange(event,'cm')">
+        <button class="secondary-btn" onclick="document.getElementById('cm-input').click()">Choose CSV</button>
+        <div class="upload-status" id="cm-status"></div>
+      </div>
+    </div>
+
+    <div class="section-title" style="margin-top:20px">Generate & Download</div>
+    <div style="padding:0 16px 16px">
+      <button id="generate-btn" onclick="generatePayrollReport()">Generate Report</button>
+      <div class="upload-status" id="generate-status"></div>
+    </div>
+    <div class="table-wrap" style="padding:16px">${reportsHtml}</div>
+  `;
+}
+
+function handlePayrollDragOver(event, kind) {
+  event.preventDefault();
+  document.getElementById(`${kind}-upload-card`)?.classList.add('dragover');
+}
+function handlePayrollDragLeave(event, kind) {
+  event.preventDefault();
+  document.getElementById(`${kind}-upload-card`)?.classList.remove('dragover');
+}
+function handlePayrollDrop(event, kind) {
+  event.preventDefault();
+  document.getElementById(`${kind}-upload-card`)?.classList.remove('dragover');
+  const file = event.dataTransfer?.files?.[0];
+  if (file) uploadPayrollFile(file, kind);
+}
+function handlePayrollInputChange(event, kind) {
+  const file = event.target.files?.[0];
+  if (file) uploadPayrollFile(file, kind);
+  event.target.value = '';
+}
+async function uploadPayrollFile(file, kind) {
+  const statusEl = document.getElementById(`${kind}-status`);
+  const label = kind === 'na' ? 'Never Attended Report' : 'Customer mapping';
+  const endpoint = kind === 'na' ? '/payroll/upload-never-attended' : '/payroll/upload-customer-map';
+  if (statusEl) { statusEl.style.color = '#64748b'; statusEl.textContent = `Uploading ${file.name}…`; }
+  const form = new FormData();
+  form.append('file', file, file.name);
+  try {
+    const resp = await fetch(endpoint, { method: 'POST', body: form });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.message || 'Upload failed');
+    payrollFlash = { ok: true, text: `${label} — ${file.name}: ${data.message}` };
+  } catch (e) {
+    payrollFlash = { ok: false, text: `${label} — ${file.name} was NOT ingested. ${e.message || e}` };
+  }
+  await loadPayroll();  // re-render so the Ready/Needed badges AND the flash update together
+}
+async function generatePayrollReport() {
+  const btn = document.getElementById('generate-btn');
+  const statusEl = document.getElementById('generate-status');
+  if (btn) btn.disabled = true;
+  if (statusEl) { statusEl.style.color = '#64748b'; statusEl.textContent = 'Generating…'; }
+  try {
+    const resp = await fetch('/payroll/generate', { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.error || 'Generation failed');
+    payrollFlash = { ok: true, text: `Report generated: ${data.filename} — download it in the list below.` };
+  } catch (e) {
+    payrollFlash = { ok: false, text: `Report generation failed. ${e.message || e}` };
+  }
+  await loadPayroll();
 }
 
 // ─── Chat ───────────────────────────────────────────────
@@ -805,6 +977,178 @@ def _set_rep_target(payload):
         conn.close()
 
 
+def _payroll_status():
+    """Everything the Payroll tab needs to render: the full 7-input
+    provenance checklist (mirroring the June audit's own input list),
+    grouped Performance / Salary, plus the list of generated files.
+
+    Each input names HOW it flows in — some arrive here (drop card), some
+    via the Chat tab's Callyzer upload, some via the Shopify API, and one
+    (offer letters) is transcribed into payroll_config.json rather than
+    parsed. The UI reads this so it always agrees with what's actually
+    ingested, never a hardcoded assumption."""
+    conn = get_connection()
+    try:
+        config = payroll_report.load_config()
+        calls_n = conn.execute("SELECT COUNT(*) FROM callyzer_calls").fetchone()[0]
+        never_attended_n = conn.execute("SELECT COUNT(*) FROM callyzer_never_attended").fetchone()[0]
+        leads_n = conn.execute("SELECT COUNT(*) FROM callyzer_leads").fetchone()[0]
+        reps_n = conn.execute("SELECT COUNT(*) FROM reps").fetchone()[0]
+        orders_n = conn.execute("SELECT COUNT(*) FROM shopify_orders").fetchone()[0]
+        customer_map_n = conn.execute("SELECT COUNT(*) FROM customer_salesperson_map").fetchone()[0]
+        customer_map_manual_n = conn.execute(
+            "SELECT COUNT(*) FROM customer_salesperson_map WHERE source = 'manual_csv'").fetchone()[0]
+        customer_map_lead_n = conn.execute(
+            "SELECT COUNT(*) FROM customer_salesperson_map WHERE source = 'lead_assignment'").fetchone()[0]
+        valid_call_definition = config.get("valid_call_definition")
+        employees = {k: v for k, v in config.get("employees", {}).items() if not k.startswith("_")}
+        # "Offer letters" are considered captured once every configured
+        # employee has their type-appropriate pay term filled in.
+        offer_terms_ok = bool(employees) and all(
+            (e.get("fixed_salary") is not None) if e.get("employment_type") == "full_time"
+            else (e.get("per_call_rate") is not None)
+            for e in employees.values()
+        )
+    finally:
+        conn.close()
+
+    # channel: how this input reaches the system.
+    #   'payroll'  -> drop card on this tab
+    #   'chat'     -> Chat tab's Callyzer CSV upload
+    #   'api'      -> automatic Shopify sync (no manual step)
+    #   'config'   -> transcribed into payroll_config.json (not parsed)
+    #   'derived'  -> computed from another input, no separate file needed
+    inputs = [
+        {"group": "Performance", "name": "Periodic Call History",
+         "channel": "chat", "satisfied": calls_n > 0,
+         "detail": f"{calls_n:,} calls ingested" if calls_n else "Not ingested — upload on the Chat tab."},
+        {"group": "Performance", "name": "Never Attended Report",
+         "channel": "payroll", "endpoint": "never_attended", "satisfied": never_attended_n > 0,
+         "detail": f"{never_attended_n:,} missed-call rows" if never_attended_n
+                   else "Not ingested — drop the export below (format needs a real sample to confirm)."},
+        {"group": "Performance", "name": "Lead Data Report",
+         "channel": "chat", "satisfied": leads_n > 0,
+         "detail": f"{leads_n:,} leads ingested" if leads_n else "Not ingested — upload on the Chat tab."},
+        {"group": "Performance", "name": "Sales Person Info (employee → SIM)",
+         "channel": "derived", "satisfied": reps_n > 0,
+         "detail": f"{reps_n} rep(s) mapped — currently derived from call history (SIM + name). "
+                   f"A dedicated Sales Person Info file isn't required, but would be authoritative."},
+        {"group": "Salary", "name": "Orders Export",
+         "channel": "api", "satisfied": orders_n > 0,
+         "detail": f"{orders_n:,} orders — auto-synced from Shopify every 15 min (no upload needed)."
+                   if orders_n else "No orders synced yet — check the Shopify sync."},
+        {"group": "Salary", "name": "Customer Export (customer → salesperson)",
+         "channel": "payroll", "endpoint": "customer_map", "satisfied": customer_map_n > 0,
+         "detail": (
+             (f"{customer_map_manual_n:,} manually mapped" if customer_map_manual_n else "")
+             + (", " if customer_map_manual_n and customer_map_lead_n else "")
+             + (f"{customer_map_lead_n:,} derived from lead assignment (⚠ who a LEAD was assigned to, "
+                f"not a confirmed conversion — review before trusting for payout)" if customer_map_lead_n else "")
+         ) if customer_map_n else "No mappings yet — drop a CSV below (Shopify orders carry no salesperson tag)."},
+        {"group": "Salary", "name": "Offer Letters / Agreements",
+         "channel": "config", "satisfied": offer_terms_ok,
+         "detail": ("Salary terms captured in payroll_config.json"
+                    + ("" if valid_call_definition
+                       else " — but \"valid call\" definition still UNSET (blocks part-time pay).")
+                    ) if offer_terms_ok else "Salary terms missing in payroll_config.json."},
+    ]
+
+    reports = []
+    if os.path.isdir(payroll_report.OUTPUT_DIR):
+        for name in os.listdir(payroll_report.OUTPUT_DIR):
+            if not name.lower().endswith(".xlsx"):
+                continue
+            path = os.path.join(payroll_report.OUTPUT_DIR, name)
+            stat = os.stat(path)
+            reports.append({
+                "name": name,
+                "size_kb": round(stat.st_size / 1024, 1),
+                "generated_at": time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime)),
+                "mtime": stat.st_mtime,
+            })
+    reports.sort(key=lambda r: r["mtime"], reverse=True)
+
+    return {
+        "valid_call_definition": valid_call_definition,
+        "never_attended_rows": never_attended_n,
+        "customer_map_rows": customer_map_n,
+        "inputs": inputs,
+        "reports": reports,
+    }
+
+
+def _payroll_upload(headers, body, kind):
+    """kind: 'never_attended' or 'customer_map'. Shares the same multipart
+    parsing as the Callyzer upload — see _parse_uploaded_file."""
+    filename, file_bytes = _parse_uploaded_file(headers, body)
+    safe_name = os.path.basename(filename or "upload.csv")
+    if not safe_name.lower().endswith(".csv"):
+        raise ValueError("Please upload a CSV file.")
+
+    payroll_dir = os.path.dirname(os.path.abspath(payroll_report.__file__))
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    if kind == "never_attended":
+        os.makedirs(ingest_never_attended.INCOMING_DIR, exist_ok=True)
+        upload_path = os.path.join(ingest_never_attended.INCOMING_DIR, f"browser-{stamp}-{safe_name}")
+        with open(upload_path, "wb") as f:
+            f.write(file_bytes)
+        conn = get_connection()
+        try:
+            with open(upload_path, "r", encoding="utf-8-sig", newline="") as f:
+                import csv as csv_module
+                reader = csv_module.DictReader(f)
+                if not reader.fieldnames:
+                    return {"ok": False, "message": f"{safe_name} is empty or unreadable."}
+                mapped_headers = ingest_never_attended._match_headers(reader.fieldnames)
+                has_timestamp = "timestamp" in mapped_headers or \
+                    ("call_date" in mapped_headers and "call_time" in mapped_headers)
+                missing = []
+                if not has_timestamp:
+                    missing.append("a date/time column")
+                if "rep_sim" not in mapped_headers:
+                    missing.append("an employee/SIM number column")
+                if "customer_number" not in mapped_headers:
+                    missing.append("a customer/to-number column")
+                if missing:
+                    return {
+                        "ok": False,
+                        "message": (f"Refusing to guess: couldn't confidently find {', '.join(missing)}. "
+                                    f"Headers seen: {reader.fieldnames}. Nothing was ingested — the file "
+                                    f"format needs confirming (see payroll/README.md)."),
+                    }
+                read, ins, flg, dup = ingest_never_attended.ingest_never_attended(conn, upload_path, reader, mapped_headers)
+            os.makedirs(ingest_never_attended.PROCESSED_DIR, exist_ok=True)
+            import shutil as shutil_module
+            shutil_module.move(upload_path, os.path.join(ingest_never_attended.PROCESSED_DIR, os.path.basename(upload_path)))
+            return {"ok": True, "message": f"{safe_name}: read={read} inserted={ins} duplicate={dup} flagged={flg}"}
+        finally:
+            conn.close()
+
+    elif kind == "customer_map":
+        uploads_dir = os.path.join(payroll_dir, "incoming", "customer_map_uploads")
+        os.makedirs(uploads_dir, exist_ok=True)
+        upload_path = os.path.join(uploads_dir, f"{stamp}-{safe_name}")
+        with open(upload_path, "wb") as f:
+            f.write(file_bytes)
+        conn = get_connection()
+        try:
+            stats = ingest_customer_map.ingest_customer_map(conn, upload_path)
+        finally:
+            conn.close()
+
+        if stats.get("format_error"):
+            return {"ok": False, "message": stats["message"]}
+
+        msg = (f"Mapped {stats['mapped']} customer(s). "
+               f"{stats['unresolved_phone']} unresolvable phone(s), "
+               f"{stats['unresolved_rep']} rep(s) with no call history yet.")
+        return {"ok": True, "message": msg, "warnings": stats["warnings"]}
+
+    else:
+        raise ValueError(f"Unknown upload kind: {kind}")
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # keep the console quiet
@@ -835,6 +1179,36 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps({"history": history}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path == "/payroll/status":
+            try:
+                data = _payroll_status()
+            except Exception as e:
+                data = {"error": str(e)}
+            body = json.dumps(data, default=str).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path.startswith("/payroll/download/"):
+            requested = os.path.basename(self.path[len("/payroll/download/"):])
+            # basename() strips any path components, so a '..' segment
+            # can't escape OUTPUT_DIR regardless of how it's encoded.
+            file_path = os.path.join(payroll_report.OUTPUT_DIR, requested)
+            if not requested.lower().endswith(".xlsx") or not os.path.isfile(file_path):
+                self.send_response(404)
+                self.end_headers()
+                return
+            with open(file_path, "rb") as f:
+                body = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.send_header("Content-Disposition", f'attachment; filename="{requested}"')
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -884,6 +1258,34 @@ class Handler(BaseHTTPRequestHandler):
                 payload = json.loads(raw)
                 _set_rep_target(payload)
                 body = json.dumps({"ok": True}).encode("utf-8")
+                self.send_response(200)
+            except Exception as e:
+                body = json.dumps({"ok": False, "error": str(e)}).encode("utf-8")
+                self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path in ("/payroll/upload-never-attended", "/payroll/upload-customer-map"):
+            kind = "never_attended" if self.path.endswith("never-attended") else "customer_map"
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length)
+            try:
+                result = _payroll_upload(self.headers, raw, kind)
+                body = json.dumps(result).encode("utf-8")
+                self.send_response(200 if result.get("ok") else 400)
+            except Exception as e:
+                body = json.dumps({"ok": False, "message": str(e)}).encode("utf-8")
+                self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/payroll/generate":
+            try:
+                out_path = payroll_report.generate_report_file()
+                payload = {"ok": True, "filename": os.path.basename(out_path)}
+                body = json.dumps(payload).encode("utf-8")
                 self.send_response(200)
             except Exception as e:
                 body = json.dumps({"ok": False, "error": str(e)}).encode("utf-8")
