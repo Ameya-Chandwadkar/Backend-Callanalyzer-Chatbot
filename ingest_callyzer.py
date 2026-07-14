@@ -33,7 +33,7 @@ import shutil
 from datetime import datetime
 
 from common import get_connection, normalize_phone, row_hash, now_iso, \
-    start_log, finish_log, flag_row, SCRIPT_DIR
+    start_log, finish_log, flag_row, rebuild_rep_directory, SCRIPT_DIR
 
 INCOMING_DIR = os.path.join(SCRIPT_DIR, "incoming")
 PROCESSED_DIR = os.path.join(INCOMING_DIR, "processed")
@@ -347,6 +347,10 @@ def process_file(conn, path):
 
     os.makedirs(PROCESSED_DIR, exist_ok=True)
     shutil.move(path, os.path.join(PROCESSED_DIR, os.path.basename(path)))
+
+    # Keep rep name canonicalization current — every ingestion entry point
+    # (CLI, chat upload button, incoming/ watcher) funnels through here.
+    rebuild_rep_directory(conn)
 
 
 def main():

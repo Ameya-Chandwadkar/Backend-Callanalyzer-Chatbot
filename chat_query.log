@@ -4,3 +4,16 @@
 2026-07-14 12:36:47,262 WARNING cerebras transient error, retrying in 1.0s: HTTP 429: {"message":"We're experiencing high traffic right now! Please try again soon.","type":"too_many_requests_error","param":"queue","code":"queue_exceeded"}
 2026-07-14 12:36:49,415 WARNING cerebras transient error, retrying in 54.0s: HTTP 429: {"message":"Requests per minute limit exceeded - too many requests sent.","type":"too_many_requests_error","param":"quota","code":"request_quota_exceeded"}
 2026-07-14 12:37:21,480 WARNING cerebras transient error, retrying in 58.0s: HTTP 429: {"message":"Requests per minute limit exceeded - too many requests sent.","type":"too_many_requests_error","param":"quota","code":"request_quota_exceeded"}
+2026-07-14 15:19:58,420 WARNING SQL attempt 1 failed: no such column: oa.attributing_rep_sim | WITH week_orders AS (
+    SELECT oa.attributing_rep_sim, oa.total_price
+    FROM v_order_attribution oa
+    WHERE date(oa.created_at,'localtime') BETWEEN date('now','localtime','-6 days') AND date('now','localtime')
+      AND oa.attributing_rep_sim IS NOT NULL
+)
+SELECT r.canonical_name,
+       SUM(week_orders.total_price) AS revenue
+FROM week_orders
+JOIN reps r ON r.rep_sim_number = week_orders.attributing_rep_sim
+GROUP BY r.canonical_name
+ORDER BY revenue DESC
+LIMIT 1;

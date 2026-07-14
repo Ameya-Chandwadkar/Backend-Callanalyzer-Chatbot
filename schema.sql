@@ -129,6 +129,44 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_synced_at TEXT
 );
 
+-- ─────────────────────────────────────────────
+-- REP DIRECTORY — canonical identity for name-variant reps
+-- ─────────────────────────────────────────────
+
+-- rep_sim_number (the company SIM) is the one stable identity Callyzer
+-- gives us; rep_name drifts ("sara" / "Sara" / "Sara K"). One row per
+-- sim number, holding the display name to use everywhere.
+CREATE TABLE IF NOT EXISTS reps (
+    rep_sim_number  TEXT PRIMARY KEY,
+    canonical_name  TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+-- Every distinct name spelling ever seen for a rep, mapped to their
+-- canonical name — lets name-only sources (leads.assigned_to, Shopify
+-- rep_attribution) resolve to the same identity as sim-number-backed
+-- call data. alias_key is lower(trim(name)) for case/whitespace-insensitive
+-- lookup. Rebuilt by common.rebuild_rep_directory() after every Callyzer ingest.
+CREATE TABLE IF NOT EXISTS rep_name_aliases (
+    alias_key       TEXT PRIMARY KEY,
+    rep_sim_number  TEXT REFERENCES reps(rep_sim_number),
+    canonical_name  TEXT NOT NULL
+);
+
+-- ─────────────────────────────────────────────
+-- REP TARGETS — for progress tracking on the dashboard
+-- ─────────────────────────────────────────────
+
+-- One row per rep. Nullable columns mean "no target set" (dashboard
+-- shows '—' rather than a misleading 0%). Set via the dashboard's
+-- inline target editor (POST /set-target in chat_web.py).
+CREATE TABLE IF NOT EXISTS rep_targets (
+    rep_sim_number        TEXT PRIMARY KEY REFERENCES reps(rep_sim_number),
+    daily_call_target     INTEGER,
+    weekly_revenue_target REAL,
+    updated_at            TEXT NOT NULL
+);
+
 -- Every question asked through chat_query.py / chat_web.py, with the SQL
 -- used and the answer given. This is what lets the assistant understand
 -- follow-up questions ("and what about Suman?") and gives you a
@@ -173,4 +211,51 @@ SELECT o.*
 FROM shopify_orders o
 LEFT JOIN callyzer_calls c
     ON o.customer_phone_norm = c.customer_number_norm
+    AND c.customer_number_norm IS NOT NULL
 WHERE c.call_id IS NULL;
+
+-- ─────────────────────────────────────────────
+-- DERIVED VIEW — lead-to-order attribution
+-- ─────────────────────────────────────────────
+
+-- Credits each order to whichever rep placed the most recent OUTGOING
+-- call to that customer's number in the ATTRIBUTION_WINDOW_DAYS days
+-- before the order — the call most plausibly responsible for the sale.
+-- If multiple reps called in that window, only the latest call counts;
+-- if no call qualifies, the order is unattributed (attributed_rep_name
+-- IS NULL) rather than guessed at.
+--
+-- Both timestamps are converted to IST before comparing: call_timestamp
+-- is already IST, shopify_orders.created_at is UTC ('...Z'). Getting this
+-- wrong was the exact bug fixed in chat_query.py's schema notes — see
+-- that file's shopify_orders TABLE_NOTES entry.
+--
+-- Window is 7 days, matching the dashboard's existing 7-day reporting
+-- period. Change ATTRIBUTION_WINDOW_DAYS below (both places) if the
+-- business wants a different cutoff.
+CREATE VIEW IF NOT EXISTS v_order_attribution AS
+SELECT order_id, order_number, created_at, total_price, customer_phone_norm,
+       attributing_call_id, attributing_call_timestamp,
+       attributed_rep_sim, attributed_rep_name, days_between_call_and_order
+FROM (
+    SELECT
+        o.order_id, o.order_number, o.created_at, o.total_price, o.customer_phone_norm,
+        c.call_id AS attributing_call_id,
+        c.call_timestamp AS attributing_call_timestamp,
+        c.rep_sim_number AS attributed_rep_sim,
+        COALESCE(r.canonical_name, c.rep_name) AS attributed_rep_name,
+        ROUND(julianday(datetime(o.created_at, 'localtime')) - julianday(c.call_timestamp), 2)
+            AS days_between_call_and_order,
+        ROW_NUMBER() OVER (
+            PARTITION BY o.order_id ORDER BY c.call_timestamp DESC
+        ) AS rn
+    FROM shopify_orders o
+    LEFT JOIN callyzer_calls c
+        ON c.customer_number_norm = o.customer_phone_norm
+        AND c.customer_number_norm IS NOT NULL
+        AND c.direction = 'outgoing'
+        AND datetime(c.call_timestamp) <= datetime(o.created_at, 'localtime')
+        AND datetime(c.call_timestamp) >= datetime(o.created_at, 'localtime', '-7 days')
+    LEFT JOIN reps r ON r.rep_sim_number = c.rep_sim_number
+) ranked
+WHERE rn = 1;

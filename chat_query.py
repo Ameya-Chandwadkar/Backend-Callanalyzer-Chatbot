@@ -205,17 +205,41 @@ TABLE_NOTES = {
                       "duration_seconds comes from the export's Duration column. connected=1 means "
                       "duration_seconds > 0, while a valid connection means duration_seconds > 45. "
                       "direction is 'incoming' or 'outgoing'. rep_sim_number is the most reliable way "
-                      "to identify a rep (names have spelling variants).",
+                      "to identify a rep (names have spelling variants) — for any question grouped or "
+                      "filtered BY REP NAME, join to reps ON reps.rep_sim_number = callyzer_calls.rep_sim_number "
+                      "and use reps.canonical_name, NOT raw rep_name (spelling variants like 'sara'/'Sara' "
+                      "will otherwise split one person into two rows). For a name given in the question that "
+                      "isn't an exact match, resolve it via rep_name_aliases (alias_key = lower(trim(name))) "
+                      "rather than LIKE-guessing.",
     "callyzer_leads": "One row per lead, reflecting its CURRENT state, not history. "
-                      "tags may contain 'IndiaMart Lead' or 'Gold Lead'. assigned_to is a rep name.",
+                      "tags may contain 'IndiaMart Lead' or 'Gold Lead'. assigned_to is a rep name, often "
+                      "formatted 'Name(+91-...)' — strip anything from '(' onward before matching it to "
+                      "reps/rep_name_aliases.",
     "shopify_orders": "One row per Shopify order. created_at is stored in UTC (ends in 'Z'), unlike "
                       "callyzer_calls.call_timestamp which is already IST. ALWAYS write "
                       "date(created_at,'localtime') when filtering or grouping created_at by date — "
                       "never bare date(created_at), or orders placed late evening IST land on the "
-                      "wrong day. rep_attribution may be NULL — salesperson attribution is not "
-                      "reliably populated, so don't treat NULL as 'no rep'.",
+                      "wrong day. rep_attribution is a raw Shopify field (metafield/tag) and is NOT "
+                      "reliably populated — don't treat NULL as 'no rep', and don't use it to answer "
+                      "'which rep sold this' questions. Use v_order_attribution instead (see below).",
     "shopify_customers": "One row per Shopify customer. Not every order has a linked customer "
                          "(guest checkouts), so this table is smaller than shopify_orders.",
+    "reps": "Canonical rep identity, one row per rep_sim_number. canonical_name is the display name to "
+           "use everywhere instead of raw rep_name/assigned_to spellings.",
+    "rep_name_aliases": "Every name spelling ever seen for a rep, mapping alias_key (lower/trimmed) to "
+                        "canonical_name and rep_sim_number. Use this to resolve a name typed in a "
+                        "question, or a leads.assigned_to value, to its canonical identity.",
+    "rep_targets": "One row per rep_sim_number with optional daily_call_target and/or "
+                  "weekly_revenue_target (either may be NULL = not set, meaning 'no target', not zero).",
+    "v_order_attribution": "THE authoritative source for 'which rep sold/converted this order' or "
+                           "'how much revenue has each rep driven'. One row per Shopify order, credited "
+                           "to whichever rep placed the most recent OUTGOING call to that customer's "
+                           "number in the 7 days before the order (attributed_rep_name/attributed_rep_sim "
+                           "are NULL if no qualifying call exists — that order is genuinely unattributed, "
+                           "don't guess). Do NOT reconstruct this logic yourself by joining "
+                           "callyzer_calls to shopify_orders directly — that produces one row per "
+                           "matching call (fan-out / double-counts revenue) instead of one row per order. "
+                           "Always query this view for attribution/revenue-per-rep questions.",
     "v_calls_with_orders": "VIEW joining calls to orders on phone number.",
     "v_unmatched_orders": "VIEW of Shopify orders with no matching call by phone number.",
     "ingestion_log": "Metadata about each ingestion run — useful for 'is the data up to date'.",

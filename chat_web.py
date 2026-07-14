@@ -21,7 +21,7 @@ from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import chat_query
-from common import get_connection
+from common import get_connection, now_iso
 import ingest_callyzer
 
 PORT = 5050
@@ -131,6 +131,13 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .bar-track { flex: 1; background: #f1f5f9; border-radius: 4px; height: 7px; overflow: hidden; }
   .bar-fill  { height: 100%; background: #2563eb; border-radius: 4px; transition: width 0.4s; }
   .bar-label { font-size: 12px; color: #64748b; min-width: 28px; text-align: right; }
+
+  /* Targets */
+  .target-cell { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px; }
+  .target-sub { color: #64748b; font-size: 11px; }
+  .target-unset { color: #94a3b8; font-style: italic; }
+  .target-edit { color: #2563eb; text-decoration: none; font-size: 11px; }
+  .target-edit:hover { text-decoration: underline; }
 
   /* Loading / error */
   .loading { text-align: center; padding: 48px; color: #94a3b8; font-size: 14px; }
@@ -283,7 +290,7 @@ function renderDashboard(d) {
   const maxCalls = Math.max(...reps.map(r=>r.total_calls), 1);
   const maxConn  = Math.max(...reps.map(r=>r.connected_calls), 1);
   const maxValid = Math.max(...reps.map(r=>r.valid_connections), 1);
-  const maxConverted = Math.max(...reps.map(r=>r.leads_converted), 1);
+  const maxRevenue = Math.max(...reps.map(r=>r.attributed_revenue), 1);
 
   function pct(n, total) {
     if (!total) return '—';
@@ -299,6 +306,24 @@ function renderDashboard(d) {
     return `<div class="bar-wrap">
       <div class="bar-track"><div class="bar-fill" style="width:${w}%"></div></div>
       <div class="bar-label">${val}</div>
+    </div>`;
+  }
+  function money(n) {
+    return '₹' + Math.round(n||0).toLocaleString('en-IN');
+  }
+  // Progress-vs-target cell. target null/undefined = never set; shows a
+  // "set target" link instead of a misleading 0%.
+  function targetCell(value, target, repSim, metric, fmt) {
+    const editLink = `<a href="#" class="target-edit" onclick="setTarget('${repSim}','${metric}');return false;">${target==null?'set target':'edit'}</a>`;
+    if (target == null) {
+      return `<div class="target-cell"><span class="target-unset">no target</span> ${editLink}</div>`;
+    }
+    const p = target > 0 ? Math.round(100*value/target) : 0;
+    const cls = p >= 100 ? 'high' : (p >= 50 ? 'mid' : 'low');
+    return `<div class="target-cell">
+      <span class="badge ${cls}">${p}%</span>
+      <span class="target-sub">${fmt(value)} / ${fmt(target)}</span>
+      ${editLink}
     </div>`;
   }
 
@@ -335,16 +360,18 @@ function renderDashboard(d) {
       <td>${bar(r.valid_connections, maxValid)}</td>
       <td>${badge(connRate)}</td>
       <td>${badge(validRate)}</td>
-      <td>${bar(r.leads_converted, maxConverted)}</td>
+      <td>${bar(r.attributed_revenue, maxRevenue)}<div class="target-sub">${r.attributed_orders} order(s)</div></td>
       <td>${r.avg_duration_sec ? Math.round(r.avg_duration_sec)+'s' : '—'}</td>
       <td>${r.outgoing_calls}</td>
       <td>${r.incoming_calls}</td>
       <td>${r.leads_assigned}</td>
       <td>${r.leads_attempted}</td>
+      <td>${targetCell(r.calls_today, r.daily_call_target, r.rep_sim_number, 'calls', v=>v)}</td>
+      <td>${targetCell(r.attributed_revenue, r.weekly_revenue_target, r.rep_sim_number, 'revenue', money)}</td>
     </tr>`;
   }).join('');
 
-  if (!rows) rows = '<tr><td colspan="12" style="text-align:center;color:#94a3b8;padding:28px">No call data found for the last 7 days.</td></tr>';
+  if (!rows) rows = '<tr><td colspan="14" style="text-align:center;color:#94a3b8;padding:28px">No call data found for the last 7 days.</td></tr>';
 
   document.getElementById('dash-content').innerHTML = `
     ${staleNote}
@@ -372,6 +399,11 @@ function renderDashboard(d) {
         <div class="value">${totals.valid_connections ?? '—'}</div>
         <div class="sub">${pct(totals.valid_connections, totals.total_calls)} with duration > 45s</div>
       </div>
+      <div class="summary-card" title="An order counts here only if a rep's outgoing call to that customer landed in the 7 days before the order — not just any call ever.">
+        <div class="label">Attributed Revenue</div>
+        <div class="value">${money(totals.attributed_revenue)}</div>
+        <div class="sub">${totals.attributed_orders ?? 0} order(s) traced to a call within 7 days</div>
+      </div>
     </div>
 
     <div class="section-title">Employee Breakdown</div>
@@ -385,18 +417,43 @@ function renderDashboard(d) {
             <th>Valid Connections</th>
             <th>Connect Rate</th>
             <th>Valid Rate</th>
-            <th>Converted Leads</th>
+            <th>Attributed Revenue (7d)</th>
             <th>Avg Duration</th>
             <th>Outgoing</th>
             <th>Incoming</th>
             <th>Leads Assigned</th>
             <th>Leads Attempted</th>
+            <th>Calls Today vs Target</th>
+            <th>Revenue (7d) vs Target</th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
       </table>
     </div>
   `;
+}
+
+async function setTarget(repSim, metric) {
+  const label = metric === 'calls' ? 'Daily call target' : 'Weekly revenue target (₹)';
+  const val = prompt(label + ':');
+  if (val === null || val.trim() === '') return;
+  const num = Number(val);
+  if (!Number.isFinite(num) || num < 0) { alert('Enter a valid non-negative number.'); return; }
+  const body = { rep_sim_number: repSim };
+  if (metric === 'calls') body.daily_call_target = num;
+  else body.weekly_revenue_target = num;
+  try {
+    const resp = await fetch('/set-target', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.error || 'Failed to save target.');
+    loadDashboard();
+  } catch (e) {
+    alert('Could not save target: ' + (e.message || e));
+  }
 }
 
 function openUploadPicker() {
@@ -541,49 +598,54 @@ def get_dashboard_data():
         reps = [dict(r) for r in conn.execute("""
             WITH call_stats AS (
                 SELECT
-                    lower(rep_name) AS rep_key,
-                    MIN(rep_name) AS rep_name,
+                    c.rep_sim_number AS rep_key,
+                    COALESCE(r.canonical_name, MIN(c.rep_name)) AS rep_name,
                     COUNT(*) AS total_calls,
-                    COALESCE(SUM(CASE WHEN COALESCE(duration_seconds, 0) > 0 THEN 1 ELSE 0 END), 0) AS connected_calls,
-                    COALESCE(SUM(CASE WHEN COALESCE(duration_seconds, 0) > 45 THEN 1 ELSE 0 END), 0) AS valid_connections,
-                    SUM(CASE WHEN direction='outgoing' THEN 1 ELSE 0 END) AS outgoing_calls,
-                    SUM(CASE WHEN direction='incoming' THEN 1 ELSE 0 END) AS incoming_calls,
-                    ROUND(AVG(CASE WHEN COALESCE(duration_seconds, 0) > 0 THEN duration_seconds END), 1) AS avg_duration_sec
-                FROM callyzer_calls
-                WHERE date(call_timestamp) >= date('now', 'localtime', '-7 days')
-                  AND rep_name IS NOT NULL
-                  AND rep_name != ''
-                GROUP BY lower(rep_name)
-            ),
-            conversion_stats AS (
-                SELECT
-                    lower(c.rep_name) AS rep_key,
-                    COUNT(DISTINCT o.customer_phone_norm) AS leads_converted
+                    COALESCE(SUM(CASE WHEN COALESCE(c.duration_seconds, 0) > 0 THEN 1 ELSE 0 END), 0) AS connected_calls,
+                    COALESCE(SUM(CASE WHEN COALESCE(c.duration_seconds, 0) > 45 THEN 1 ELSE 0 END), 0) AS valid_connections,
+                    SUM(CASE WHEN c.direction='outgoing' THEN 1 ELSE 0 END) AS outgoing_calls,
+                    SUM(CASE WHEN c.direction='incoming' THEN 1 ELSE 0 END) AS incoming_calls,
+                    ROUND(AVG(CASE WHEN COALESCE(c.duration_seconds, 0) > 0 THEN c.duration_seconds END), 1) AS avg_duration_sec,
+                    SUM(CASE WHEN date(c.call_timestamp) = date('now', 'localtime') THEN 1 ELSE 0 END) AS calls_today
                 FROM callyzer_calls c
-                JOIN shopify_orders o
-                    ON o.customer_phone_norm = c.customer_number_norm
+                LEFT JOIN reps r ON r.rep_sim_number = c.rep_sim_number
                 WHERE date(c.call_timestamp) >= date('now', 'localtime', '-7 days')
-                  AND date(o.created_at, 'localtime') >= date('now', 'localtime', '-7 days')
-                  AND c.rep_name IS NOT NULL
-                  AND c.rep_name != ''
-                  AND o.customer_phone_norm IS NOT NULL
-                GROUP BY lower(c.rep_name)
+                  AND c.rep_sim_number IS NOT NULL
+                  AND c.rep_sim_number != ''
+                GROUP BY c.rep_sim_number
+            ),
+            -- Attribution: order credited to the rep whose most recent outgoing
+            -- call to that customer fell in the 7 days before the order (see
+            -- v_order_attribution in schema.sql). Far stronger than "this rep
+            -- ever called this customer" — it's time-ordered, single-rep-credited.
+            attribution_stats AS (
+                SELECT
+                    attributed_rep_sim AS rep_key,
+                    COUNT(*) AS attributed_orders,
+                    SUM(total_price) AS attributed_revenue
+                FROM v_order_attribution
+                WHERE attributed_rep_sim IS NOT NULL
+                  AND date(created_at, 'localtime') >= date('now', 'localtime', '-7 days')
+                GROUP BY attributed_rep_sim
             ),
             lead_stats AS (
                 SELECT
-                    lower(trim(CASE
-                        WHEN instr(assigned_to, '(') > 0
-                        THEN substr(assigned_to, 1, instr(assigned_to, '(') - 1)
-                        ELSE assigned_to
-                    END)) AS rep_key,
-                    COUNT(DISTINCT lead_no) AS leads_assigned,
-                    COUNT(DISTINCT CASE WHEN no_of_attempts > 0 THEN lead_no END) AS leads_attempted
-                FROM callyzer_leads
-                WHERE assigned_to IS NOT NULL
-                  AND assigned_to != ''
-                GROUP BY rep_key
+                    ra.rep_sim_number AS rep_key,
+                    COUNT(DISTINCT l.lead_no) AS leads_assigned,
+                    COUNT(DISTINCT CASE WHEN l.no_of_attempts > 0 THEN l.lead_no END) AS leads_attempted
+                FROM callyzer_leads l
+                JOIN rep_name_aliases ra ON ra.alias_key = lower(trim(CASE
+                    WHEN instr(l.assigned_to, '(') > 0
+                    THEN substr(l.assigned_to, 1, instr(l.assigned_to, '(') - 1)
+                    ELSE l.assigned_to
+                END))
+                WHERE l.assigned_to IS NOT NULL
+                  AND l.assigned_to != ''
+                  AND ra.rep_sim_number IS NOT NULL
+                GROUP BY ra.rep_sim_number
             )
                 SELECT
+                    cs.rep_key AS rep_sim_number,
                     cs.rep_name,
                     cs.total_calls,
                     cs.connected_calls,
@@ -591,12 +653,17 @@ def get_dashboard_data():
                     cs.outgoing_calls,
                     cs.incoming_calls,
                     cs.avg_duration_sec,
-                    COALESCE(cv.leads_converted, 0) AS leads_converted,
+                    cs.calls_today,
+                    COALESCE(ast.attributed_orders, 0) AS attributed_orders,
+                    COALESCE(ast.attributed_revenue, 0.0) AS attributed_revenue,
                     COALESCE(ls.leads_assigned, 0) AS leads_assigned,
-                COALESCE(ls.leads_attempted, 0) AS leads_attempted
+                    COALESCE(ls.leads_attempted, 0) AS leads_attempted,
+                    t.daily_call_target,
+                    t.weekly_revenue_target
             FROM call_stats cs
-            LEFT JOIN conversion_stats cv ON cv.rep_key = cs.rep_key
+            LEFT JOIN attribution_stats ast ON ast.rep_key = cs.rep_key
             LEFT JOIN lead_stats ls ON ls.rep_key = cs.rep_key
+            LEFT JOIN rep_targets t ON t.rep_sim_number = cs.rep_key
             ORDER BY cs.total_calls DESC
         """).fetchall()]
 
@@ -609,14 +676,13 @@ def get_dashboard_data():
                 FROM callyzer_calls
                 WHERE date(call_timestamp) >= date('now', 'localtime', '-7 days')
             ),
-            conversion_totals AS (
-                SELECT COUNT(DISTINCT o.customer_phone_norm) AS leads_converted
-                FROM callyzer_calls c
-                JOIN shopify_orders o
-                    ON o.customer_phone_norm = c.customer_number_norm
-                WHERE date(c.call_timestamp) >= date('now', 'localtime', '-7 days')
-                  AND date(o.created_at, 'localtime') >= date('now', 'localtime', '-7 days')
-                  AND o.customer_phone_norm IS NOT NULL
+            attribution_totals AS (
+                SELECT
+                    COUNT(*) AS attributed_orders,
+                    SUM(total_price) AS attributed_revenue
+                FROM v_order_attribution
+                WHERE attributed_rep_sim IS NOT NULL
+                  AND date(created_at, 'localtime') >= date('now', 'localtime', '-7 days')
             ),
             lead_totals AS (
                 SELECT
@@ -628,11 +694,12 @@ def get_dashboard_data():
                 ct.total_calls,
                 ct.connected_calls,
                 ct.valid_connections,
-                cv.leads_converted,
+                COALESCE(at.attributed_orders, 0) AS attributed_orders,
+                COALESCE(at.attributed_revenue, 0.0) AS attributed_revenue,
                 lt.leads_assigned,
                 lt.leads_attempted
             FROM call_totals ct
-            CROSS JOIN conversion_totals cv
+            CROSS JOIN attribution_totals at
             CROSS JOIN lead_totals lt
         """).fetchone())
 
@@ -695,6 +762,47 @@ def _ingest_uploaded_callyzer_file(filename, file_bytes):
         conn.close()
 
     return upload_name
+
+
+def _set_rep_target(payload):
+    rep_sim = (payload.get("rep_sim_number") or "").strip()
+    if not rep_sim:
+        raise ValueError("rep_sim_number is required.")
+    daily_call_target = payload.get("daily_call_target")
+    weekly_revenue_target = payload.get("weekly_revenue_target")
+    if daily_call_target is None and weekly_revenue_target is None:
+        raise ValueError("Provide daily_call_target and/or weekly_revenue_target.")
+    for label, val in (("daily_call_target", daily_call_target), ("weekly_revenue_target", weekly_revenue_target)):
+        if val is not None and (not isinstance(val, (int, float)) or val < 0):
+            raise ValueError(f"{label} must be a non-negative number.")
+
+    conn = get_connection()
+    try:
+        exists = conn.execute(
+            "SELECT rep_sim_number FROM reps WHERE rep_sim_number = ?", (rep_sim,)
+        ).fetchone()
+        if not exists:
+            raise ValueError("Unknown rep_sim_number — not in the rep directory.")
+
+        row = conn.execute(
+            "SELECT daily_call_target, weekly_revenue_target FROM rep_targets WHERE rep_sim_number = ?",
+            (rep_sim,),
+        ).fetchone()
+        merged_calls = daily_call_target if daily_call_target is not None else (row["daily_call_target"] if row else None)
+        merged_revenue = weekly_revenue_target if weekly_revenue_target is not None else (row["weekly_revenue_target"] if row else None)
+
+        conn.execute(
+            """INSERT INTO rep_targets (rep_sim_number, daily_call_target, weekly_revenue_target, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(rep_sim_number) DO UPDATE SET
+                 daily_call_target=excluded.daily_call_target,
+                 weekly_revenue_target=excluded.weekly_revenue_target,
+                 updated_at=excluded.updated_at""",
+            (rep_sim, merged_calls, merged_revenue, now_iso()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -761,6 +869,21 @@ class Handler(BaseHTTPRequestHandler):
                     "message": f"{stored_name} uploaded and synced into the dashboard."
                 }
                 body = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+            except Exception as e:
+                body = json.dumps({"ok": False, "error": str(e)}).encode("utf-8")
+                self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/set-target":
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length)
+            try:
+                payload = json.loads(raw)
+                _set_rep_target(payload)
+                body = json.dumps({"ok": True}).encode("utf-8")
                 self.send_response(200)
             except Exception as e:
                 body = json.dumps({"ok": False, "error": str(e)}).encode("utf-8")

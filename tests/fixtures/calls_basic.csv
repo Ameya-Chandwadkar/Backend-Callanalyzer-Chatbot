@@ -1,0 +1,7 @@
+Sr. No.,Emp. Code,Emp. Tags,Employee Name,Employee Number,To Name,Country Code,To Number,Call Type,Call Method,Call Mode,Duration,Call Date,Call Time,Notes,UniqueId,Audio Url,Call Transcript
+1,,,TestRep,9990000001,.,91,9820000001,Outgoing,Phone Call,Voice Call,0h 0m 30s,10 Jul 2026,10:00 AM,,UID-MOBILE-001,,
+2,,,TestRep,9990000001,.,91,2266020900,Outgoing,Phone Call,Voice Call,0h 0m 20s,10 Jul 2026,10:05 AM,,UID-LANDLINE-002,,
+3,,,TestRep,9990000001,.,91,9820000001,Outgoing,Phone Call,Voice Call,0h 0m 30s,10 Jul 2026,10:00 AM,,UID-MOBILE-001,,
+4,,,TestRep,9990000001,.,91,9820000001,Outgoing,Phone Call,Voice Call,0h 0m 45s,10 Jul 2026,10:00 AM,,UID-REDIAL-004,,
+5,,,TestRep,9990000001,.,91,9820000005,Outgoing,Phone Call,Voice Call,0h 0m 10s,NOT-A-DATE,10:10 AM,,UID-BADDATE-005,,
+6,,,TestRep,9990000001,.,91,,Outgoing,Phone Call,Voice Call,0h 0m 5s,10 Jul 2026,10:15 AM,,UID-BLANKNUM-006,,
