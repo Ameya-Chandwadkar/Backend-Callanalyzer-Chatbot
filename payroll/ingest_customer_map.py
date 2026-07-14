@@ -1,6 +1,6 @@
 """
 ingest_customer_map.py
-Loads payroll/customer_salesperson_map.csv into the customer_salesperson_map
+Loads a customer_salesperson_map CSV into the customer_salesperson_map
 table — the "who owns this customer account" mapping payroll order-incentive
 attribution needs, separate from call-based inference (v_order_attribution).
 
@@ -19,7 +19,8 @@ USAGE:
     the rep directory; run rebuild_rep_directory.py first if it's a brand
     new rep with no call history yet).
 
-    python payroll/ingest_customer_map.py
+    python payroll/ingest_customer_map.py [path/to/file.csv]
+    (defaults to payroll/customer_salesperson_map.csv if no path given)
 """
 
 import csv
@@ -30,18 +31,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common import get_connection, normalize_phone, canonical_rep_name, now_iso
 
-CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "customer_salesperson_map.csv")
+DEFAULT_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "customer_salesperson_map.csv")
 
 
-def main():
-    if not os.path.exists(CSV_PATH):
-        print(f"ERROR: {CSV_PATH} not found.")
-        sys.exit(1)
-
-    conn = get_connection()
+def ingest_customer_map(conn, csv_path):
+    """Core ingest logic, reusable from both the CLI and the web upload
+    endpoint. Returns a stats dict rather than printing, so callers can
+    format it however they need (console text vs. JSON for the UI)."""
     mapped = skipped_example = unresolved_phone = unresolved_rep = 0
+    warnings = []
 
-    with open(CSV_PATH, "r", encoding="utf-8-sig", newline="") as f:
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             name = (row.get("Customer Name") or "").strip()
@@ -54,13 +54,13 @@ def main():
 
             phone_norm = normalize_phone(phone_raw)
             if phone_norm is None:
-                print(f"  SKIP '{name}': phone '{phone_raw}' isn't a resolvable mobile number.")
+                warnings.append(f"SKIP '{name}': phone '{phone_raw}' isn't a resolvable mobile number.")
                 unresolved_phone += 1
                 continue
 
             canonical = canonical_rep_name(conn, rep_raw)
             if not canonical:
-                print(f"  SKIP '{name}': no salesperson given.")
+                warnings.append(f"SKIP '{name}': no salesperson given.")
                 continue
 
             rep_row = conn.execute(
@@ -68,10 +68,8 @@ def main():
             ).fetchone()
             rep_sim = rep_row["rep_sim_number"] if rep_row else None
             if rep_sim is None:
-                print(f"  WARNING '{name}': salesperson '{rep_raw}' -> '{canonical}' has no "
-                      f"call history yet (not in reps table). Stored anyway, but this rep's "
-                      f"other numbers (rep_sim_number) won't be filled in until they appear in "
-                      f"a Callyzer export.")
+                warnings.append(f"WARNING '{name}': salesperson '{rep_raw}' -> '{canonical}' has no "
+                                 f"call history yet (not in reps table). Stored anyway.")
                 unresolved_rep += 1
 
             conn.execute(
@@ -88,9 +86,28 @@ def main():
             mapped += 1
 
     conn.commit()
+    return {
+        "mapped": mapped, "skipped_example": skipped_example,
+        "unresolved_phone": unresolved_phone, "unresolved_rep": unresolved_rep,
+        "warnings": warnings,
+    }
+
+
+def main():
+    csv_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CSV_PATH
+    if not os.path.exists(csv_path):
+        print(f"ERROR: {csv_path} not found.")
+        sys.exit(1)
+
+    conn = get_connection()
+    stats = ingest_customer_map(conn, csv_path)
     conn.close()
-    print(f"\nMapped {mapped} customer(s). Skipped {skipped_example} example row(s), "
-          f"{unresolved_phone} unresolvable phone(s), {unresolved_rep} rep(s) with no call history yet.")
+
+    for w in stats["warnings"]:
+        print(f"  {w}")
+    print(f"\nMapped {stats['mapped']} customer(s). Skipped {stats['skipped_example']} example row(s), "
+          f"{stats['unresolved_phone']} unresolvable phone(s), {stats['unresolved_rep']} rep(s) "
+          f"with no call history yet.")
 
 
 if __name__ == "__main__":
