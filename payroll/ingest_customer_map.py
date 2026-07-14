@@ -34,15 +34,35 @@ from common import get_connection, normalize_phone, canonical_rep_name, now_iso
 DEFAULT_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "customer_salesperson_map.csv")
 
 
+REQUIRED_COLUMNS = ["Customer Name", "Customer Phone", "Salesperson"]
+
+
 def ingest_customer_map(conn, csv_path):
     """Core ingest logic, reusable from both the CLI and the web upload
     endpoint. Returns a stats dict rather than printing, so callers can
-    format it however they need (console text vs. JSON for the UI)."""
+    format it however they need (console text vs. JSON for the UI).
+
+    Refuses to process a file missing the required columns instead of
+    silently treating every row as unresolvable — the exact failure mode
+    that happened when a Lead Data Report (different columns entirely)
+    was dropped into this slot by mistake: it "succeeded" with 0 mapped
+    and thousands of buried warnings, which looks like nothing happened
+    rather than clearly saying "wrong file"."""
     mapped = skipped_example = unresolved_phone = unresolved_rep = 0
     warnings = []
 
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
+        fieldnames = set(reader.fieldnames or [])
+        missing = [c for c in REQUIRED_COLUMNS if c not in fieldnames]
+        if missing:
+            return {
+                "mapped": 0, "skipped_example": 0, "unresolved_phone": 0, "unresolved_rep": 0,
+                "warnings": [], "format_error": True,
+                "message": (f"This doesn't look like a customer-salesperson mapping file — missing "
+                            f"column(s) {', '.join(missing)}. Headers found: {sorted(fieldnames)}. "
+                            f"Expected: {', '.join(REQUIRED_COLUMNS)}."),
+            }
         for row in reader:
             name = (row.get("Customer Name") or "").strip()
             phone_raw = (row.get("Customer Phone") or "").strip()
@@ -89,7 +109,7 @@ def ingest_customer_map(conn, csv_path):
     return {
         "mapped": mapped, "skipped_example": skipped_example,
         "unresolved_phone": unresolved_phone, "unresolved_rep": unresolved_rep,
-        "warnings": warnings,
+        "warnings": warnings, "format_error": False,
     }
 
 
@@ -102,6 +122,10 @@ def main():
     conn = get_connection()
     stats = ingest_customer_map(conn, csv_path)
     conn.close()
+
+    if stats.get("format_error"):
+        print(f"REFUSING TO GUESS: {stats['message']}")
+        sys.exit(1)
 
     for w in stats["warnings"]:
         print(f"  {w}")
