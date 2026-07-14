@@ -312,9 +312,17 @@ function renderDashboard(d) {
 
   const freshDate = freshness.latest_call_data_through
     ? freshness.latest_call_data_through.slice(0,10) : '—';
+  const orderFreshDate = freshness.latest_order_data_through
+    ? freshness.latest_order_data_through.slice(0,10) : '—';
   const today = freshness.todays_actual_date || '';
-  const staleNote = (freshDate !== today && freshDate !== '—')
-    ? `<div class="error-note">⚠ Latest data loaded is from <strong>${freshDate}</strong> — today is ${today}. Upload today's Callyzer export to see current numbers.</div>`
+  const callStale = (freshDate !== today && freshDate !== '—')
+    ? `⚠ Call data is only loaded through <strong>${freshDate}</strong> — today is ${today}. Upload today's Callyzer export to see current numbers.`
+    : '';
+  const orderStale = (orderFreshDate !== today && orderFreshDate !== '—')
+    ? `⚠ Order data is only synced through <strong>${orderFreshDate}</strong> — today is ${today}. Run the Shopify sync to see current numbers.`
+    : '';
+  const staleNote = (callStale || orderStale)
+    ? `<div class="error-note">${[callStale, orderStale].filter(Boolean).join('<br>')}</div>`
     : '';
 
   let rows = reps.map(r => {

@@ -208,8 +208,12 @@ TABLE_NOTES = {
                       "to identify a rep (names have spelling variants).",
     "callyzer_leads": "One row per lead, reflecting its CURRENT state, not history. "
                       "tags may contain 'IndiaMart Lead' or 'Gold Lead'. assigned_to is a rep name.",
-    "shopify_orders": "One row per Shopify order. rep_attribution may be NULL — salesperson "
-                      "attribution is not reliably populated, so don't treat NULL as 'no rep'.",
+    "shopify_orders": "One row per Shopify order. created_at is stored in UTC (ends in 'Z'), unlike "
+                      "callyzer_calls.call_timestamp which is already IST. ALWAYS write "
+                      "date(created_at,'localtime') when filtering or grouping created_at by date — "
+                      "never bare date(created_at), or orders placed late evening IST land on the "
+                      "wrong day. rep_attribution may be NULL — salesperson attribution is not "
+                      "reliably populated, so don't treat NULL as 'no rep'.",
     "shopify_customers": "One row per Shopify customer. Not every order has a linked customer "
                          "(guest checkouts), so this table is smaller than shopify_orders.",
     "v_calls_with_orders": "VIEW joining calls to orders on phone number.",
