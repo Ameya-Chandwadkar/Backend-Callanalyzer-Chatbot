@@ -1,0 +1,115 @@
+{
+  "_readme": [
+    "Contract/payroll terms — the ONE place these numbers live. generate_report.py",
+    "refuses to compute a salary figure for anyone whose config has a null value it",
+    "needs, rather than silently defaulting to 0 or guessing.",
+    "",
+    "Every non-null number below was copied verbatim from",
+    "MasonMart_Combined_Audit_Salary_Jun2026.xlsx, Sheet '8. Methodology & Gaps'",
+    "(the June 2026 audit you shared) — re-confirm these are still correct before",
+    "relying on this for a new pay period, especially after probation ends or any",
+    "contract renegotiation.",
+    "",
+    "valid_call_definition is deliberately null: the June audit itself flagged this",
+    "as UNRESOLVED ('please confirm before payout') — it changes part-time pay by",
+    "roughly 6x depending on the answer. Set it to 'connected_45s' or",
+    "'any_outgoing_attempt' before running payroll for real."
+  ],
+
+  "period": {
+    "start_date": null,
+    "end_date": null,
+    "excluded_weekdays": ["Sunday"],
+    "_note": "start_date/end_date in YYYY-MM-DD. excluded_weekdays are dropped from every working-day count, matching the June audit's 'Sundays excluded' rule."
+  },
+
+  "valid_call_definition": null,
+  "_valid_call_definition_options": ["connected_45s", "any_outgoing_attempt"],
+
+  "order_incentive_tiers": {
+    "1st": 500,
+    "2nd": 250,
+    "3rd": 1000,
+    "_note": "Rupees, per the customer's order sequence with THIS company (not per rep). Source: Clause 10 / 6.2."
+  },
+  "order_incentive_qualification": {
+    "min_order_sequence": 3,
+    "min_order_value": 25000,
+    "_note": "An order incentive is only 'earned' (vs. pending) once a customer reaches their 3rd order AND that order is >= this value. Source: Clause 10."
+  },
+  "target_bonus": {
+    "min_qualified_customers": 10,
+    "_note": "A rep needs more than this many qualified customers (3rd order + min_order_value) in the period to earn any target bonus. Amount is per-rep, see employees below."
+  },
+
+  "employees": {
+    "_note": "Key = canonical_name exactly as it appears in the reps table (run rebuild_rep_directory.py first if unsure). rep_sim_number is filled in automatically by generate_report.py from the reps table — leave it null here.",
+
+    "sara": {
+      "rep_sim_number": null,
+      "employment_type": "full_time",
+      "fixed_salary": 10000,
+      "per_call_rate": null,
+      "probation": true,
+      "discipline_rules_applicable": true,
+      "target_bonus_amount": 0,
+      "feedback_bonus_per_call": null,
+      "form_bonus_amount": null
+    },
+    "suman": {
+      "rep_sim_number": null,
+      "employment_type": "full_time",
+      "fixed_salary": 10000,
+      "per_call_rate": null,
+      "probation": true,
+      "discipline_rules_applicable": true,
+      "target_bonus_amount": 0,
+      "feedback_bonus_per_call": null,
+      "form_bonus_amount": null
+    },
+    "Harshita Mishra": {
+      "rep_sim_number": null,
+      "employment_type": "part_time",
+      "fixed_salary": null,
+      "per_call_rate": 5,
+      "probation": false,
+      "discipline_rules_applicable": false,
+      "target_bonus_amount": 0,
+      "feedback_bonus_per_call": null,
+      "form_bonus_amount": null
+    },
+    "Samir": {
+      "rep_sim_number": null,
+      "employment_type": "part_time",
+      "fixed_salary": null,
+      "per_call_rate": 5,
+      "probation": false,
+      "discipline_rules_applicable": false,
+      "target_bonus_amount": 0,
+      "feedback_bonus_per_call": null,
+      "form_bonus_amount": null
+    }
+  },
+
+  "discipline_rules": {
+    "_note": "Only applied to employees with discipline_rules_applicable=true (full-time, per the June audit).",
+    "first_call_deadline": "09:10",
+    "morning_window": {
+      "start": "09:00",
+      "end": "11:00",
+      "min_outgoing_attempts": 50,
+      "min_connected_calls": 10,
+      "min_talk_minutes": 45
+    },
+    "hourly_discipline": {
+      "min_calls_per_hour": 30,
+      "min_talk_minutes_per_hour": 20
+    },
+    "rating_day_min_attempts": 50
+  },
+
+  "gold_lead": {
+    "response_target_minutes": 30,
+    "_note": "First outgoing call to a Gold Lead must land within this many minutes of lead assignment (callyzer_leads.created_date) to 'pass'. June audit marks this PROVISIONAL — the Gold Lead tag carries a date but no time, so the check is indicative only until Callyzer exports assignment time precisely."
+  }
+}

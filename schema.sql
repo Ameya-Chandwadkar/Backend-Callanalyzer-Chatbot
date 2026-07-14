@@ -61,6 +61,29 @@ CREATE TABLE IF NOT EXISTS callyzer_leads (
 CREATE INDEX IF NOT EXISTS idx_leads_contact ON callyzer_leads(contact_number_norm);
 CREATE INDEX IF NOT EXISTS idx_leads_assigned ON callyzer_leads(assigned_to);
 
+-- One row per missed call from Callyzer's "Never Attended Report" export.
+-- Column names are a best-effort guess based on the Periodic Call History
+-- export's conventions (same platform, same column vocabulary) — NOT yet
+-- confirmed against a real Never Attended export. ingest_never_attended.py
+-- fails loudly with the actual headers it saw if they don't match, rather
+-- than silently mis-mapping columns — see that file's docstring before
+-- trusting this table's data for payroll.
+CREATE TABLE IF NOT EXISTS callyzer_never_attended (
+    missed_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_timestamp        TEXT NOT NULL,       -- ISO 8601, IST (same convention as callyzer_calls)
+    rep_name               TEXT,
+    rep_sim_number          TEXT,
+    customer_number_raw      TEXT,
+    customer_number_norm     TEXT,
+    call_uid                   TEXT,
+    source_file                 TEXT NOT NULL,
+    row_hash                     TEXT NOT NULL UNIQUE,
+    ingested_at                   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_never_attended_rep ON callyzer_never_attended(rep_sim_number);
+CREATE INDEX IF NOT EXISTS idx_never_attended_timestamp ON callyzer_never_attended(call_timestamp);
+
 -- ─────────────────────────────────────────────
 -- RAW LAYER — Shopify
 -- ─────────────────────────────────────────────
@@ -91,6 +114,22 @@ CREATE TABLE IF NOT EXISTS shopify_customers (
 );
 
 CREATE INDEX IF NOT EXISTS idx_customers_phone ON shopify_customers(phone_norm);
+
+-- Explicit customer -> salesperson ownership, as used by payroll order-
+-- incentive attribution. Deliberately separate from v_order_attribution's
+-- call-recency inference (schema.sql, further down) — that view answers
+-- "whose call plausibly drove this sale"; this table answers "who owns
+-- this customer account," which is what commission/incentive payouts are
+-- contractually based on. Maintained via payroll/customer_salesperson_map.csv
+-- (see payroll/ingest_customer_map.py) until/unless a live Shopify
+-- customer-level tag or metafield is confirmed as the real source.
+CREATE TABLE IF NOT EXISTS customer_salesperson_map (
+    customer_phone_norm  TEXT PRIMARY KEY,
+    rep_sim_number         TEXT REFERENCES reps(rep_sim_number),
+    canonical_name           TEXT NOT NULL,
+    source                     TEXT NOT NULL,   -- e.g. 'manual_csv', 'shopify_tag'
+    mapped_at                   TEXT NOT NULL
+);
 
 -- ─────────────────────────────────────────────
 -- OPERATIONAL / AUDIT TABLES
@@ -259,3 +298,30 @@ FROM (
     LEFT JOIN reps r ON r.rep_sim_number = c.rep_sim_number
 ) ranked
 WHERE rn = 1;
+
+-- ─────────────────────────────────────────────
+-- DERIVED VIEW — never-attended recovery
+-- ─────────────────────────────────────────────
+
+-- callback_attempted mirrors the June audit's own methodology exactly:
+-- "Missed only; callback after missed = recovered" — i.e. a missed call
+-- only counts against a rep if there is NO later outgoing call from that
+-- same rep to that same customer. This is deliberately a JOIN against
+-- callyzer_calls at query time, not a stored column, so it can never go
+-- stale relative to the calls table (adding a callback later automatically
+-- flips a row from "never attended" to "recovered" on the next query).
+CREATE VIEW IF NOT EXISTS v_never_attended_final AS
+SELECT
+    na.missed_id, na.call_timestamp, na.rep_sim_number,
+    COALESCE(r.canonical_name, na.rep_name) AS rep_name,
+    na.customer_number_norm,
+    EXISTS (
+        SELECT 1 FROM callyzer_calls c
+        WHERE c.rep_sim_number = na.rep_sim_number
+          AND c.customer_number_norm = na.customer_number_norm
+          AND c.customer_number_norm IS NOT NULL
+          AND c.direction = 'outgoing'
+          AND datetime(c.call_timestamp) > datetime(na.call_timestamp)
+    ) AS callback_attempted
+FROM callyzer_never_attended na
+LEFT JOIN reps r ON r.rep_sim_number = na.rep_sim_number;
