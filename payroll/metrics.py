@@ -236,15 +236,31 @@ def never_attended_summary(conn, sim, call_start, call_end):
 
 # ── Order incentives (from the customer→rep map) ─────────────
 
-def order_incentives(conn, config):
+def order_incentives(conn, config, start, end):
     """Per mapped customer, walk their orders in sequence and apply the tiered
-    incentive. Only customers present in customer_salesperson_map AND with real
-    Shopify orders contribute. Returns (detail_rows, per_rep_totals, source_note)."""
+    incentive.
+
+    TWO DIFFERENT DATE SCOPES, deliberately — getting this wrong overpays real
+    money, so it's spelled out:
+      * SEQUENCE / CUMULATIVE use the customer's FULL lifetime order history,
+        because the tier (1st/2nd/3rd) is a lifetime position, not a
+        within-period one.
+      * The incentive is only AWARDED for orders actually PLACED inside the
+        report period. An order from a previous month belongs to that month's
+        payroll and must not be paid again here.
+    Orders outside the period still appear in the detail (so the sequence is
+    auditable) but award 0 and are flagged in_period=False.
+
+    Order dates are converted UTC->IST before comparing (shopify created_at is
+    'Z', the report period is IST) — same rule as everywhere else in this project.
+    """
     tiers = config["order_incentive_tiers"]
     qual = config["order_incentive_qualification"]
     rows = conn.execute(
         """SELECT m.canonical_name, m.rep_sim_number, m.customer_phone_norm, m.source,
-                  o.order_number, o.created_at, o.total_price
+                  o.order_number, o.created_at,
+                  date(o.created_at, 'localtime') AS order_date_ist,
+                  o.total_price
            FROM customer_salesperson_map m
            JOIN shopify_orders o ON o.customer_phone_norm = m.customer_phone_norm
            ORDER BY m.customer_phone_norm, o.created_at"""
@@ -261,15 +277,20 @@ def order_incentives(conn, config):
         for i, o in enumerate(orders, start=1):
             cumulative += o["total_price"] or 0
             seq = {1: "1st", 2: "2nd", 3: "3rd"}.get(i, f"{i}th")
-            amount = tiers.get(seq, 0) if i <= 3 else 0
+            tier_amount = tiers.get(seq, 0) if i <= 3 else 0
+            in_period = start <= o["order_date_ist"] <= end
+            awarded = tier_amount if in_period else 0
             earned = i >= qual["min_order_sequence"] and cumulative >= qual["min_order_value"]
             detail.append({
                 "rep": o["canonical_name"], "rep_sim": o["rep_sim_number"],
                 "customer_phone": phone, "order": o["order_number"], "sequence": seq,
+                "order_date": o["order_date_ist"], "in_period": in_period,
                 "value": o["total_price"] or 0, "cumulative": cumulative,
-                "incentive": amount, "earned": earned, "source": o["source"],
+                "tier_amount": tier_amount, "incentive": awarded,
+                "earned": earned, "source": o["source"],
             })
-            per_rep[o["rep_sim_number"]] = per_rep.get(o["rep_sim_number"], 0.0) + amount
+            if awarded:
+                per_rep[o["rep_sim_number"]] = per_rep.get(o["rep_sim_number"], 0.0) + awarded
             sources.add(o["source"])
     return detail, per_rep, sources
 

@@ -140,9 +140,11 @@ def compute_salary(conn, config, emp, ct, sub_days, order_incentive):
 
     # Order incentive
     rows.append(("Order Incentive (pending)", round(order_incentive, 2),
-                 f"Tiered per the customer's order sequence "
+                 f"Tiered per the customer's lifetime order sequence "
                  f"(1st Rs {tiers['1st']} / 2nd Rs {tiers['2nd']} / 3rd Rs {tiers['3rd']}) "
-                 f"for customers mapped to this rep.",
+                 f"for customers mapped to this rep — counting ONLY orders placed inside this "
+                 f"report period. Orders from other months belong to those months' payroll; "
+                 f"see the Order Attribution sheet for the full audit trail.",
                  "Customer map + Orders",
                  f"Earned only at order #{qual['min_order_sequence']} + Rs {qual['min_order_value']:,}."))
 
@@ -295,7 +297,7 @@ def build_workbook(conn, config):
         row = conn.execute("SELECT rep_sim_number FROM reps WHERE canonical_name = ?", (name,)).fetchone()
         emp["_resolved_rep_sim"] = row["rep_sim_number"] if row else None
 
-    order_detail, incentive_by_rep, order_sources = metrics.order_incentives(conn, config)
+    order_detail, incentive_by_rep, order_sources = metrics.order_incentives(conn, config, start, end)
 
     period_label = (f"Period {start} to {end}"
                     + ("" if explicit else "  (NO period set in payroll_config.json — showing the full "
@@ -492,8 +494,9 @@ def build_evidence_sheet(wb, conn, config, rep_cache, employees, start, end):
 def build_order_sheet(wb, conn, config, order_detail, order_sources):
     ws = wb.create_sheet("7. Order Attribution")
     ws.column_dimensions["A"].width = 18
-    for col in "BCDEFGH":
-        ws.column_dimensions[col].width = 16
+    for col in "BCDEFGHIJ":
+        ws.column_dimensions[col].width = 15
+    ws.column_dimensions["J"].width = 34
     ws.cell(1, 1, "Order Attribution & Incentive Detail").font = TITLE_FONT
     src_note = ("Source of customer->rep ownership: "
                 + (", ".join(sorted(order_sources)) if order_sources else "none")
@@ -501,21 +504,33 @@ def build_order_sheet(wb, conn, config, order_detail, order_sources):
                   "source — see Methodology), not a verified sale owner.")
     ws.cell(2, 1, src_note).font = SUBTITLE_FONT
 
-    r = 4
-    r = _write_row(ws, r, ["Salesperson", "Customer Phone", "Order", "Sequence",
+    ws.cell(3, 1, "Sequence/cumulative use the customer's FULL lifetime order history (the tier is a lifetime "
+                  "position). Incentive is only awarded for orders PLACED INSIDE the report period — an order "
+                  "from a previous month belongs to that month's payroll. Out-of-period orders are listed for "
+                  "audit but award Rs 0.").font = SUBTITLE_FONT
+
+    r = 5
+    r = _write_row(ws, r, ["Salesperson", "Customer Phone", "Order", "Order Date", "In Period?", "Sequence",
                            "Order Value (Rs)", "Cumulative (Rs)", "Incentive (Rs)", "Status"],
-                   fonts=[HEAD_FONT] * 8, fill=HEAD_FILL)
+                   fonts=[HEAD_FONT] * 10, fill=HEAD_FILL)
     if not order_detail:
-        r = _write_row(ws, r, [f"{NA} — no mapped customer has a Shopify order yet.", "", "", "", "", "", "", ""])
+        r = _write_row(ws, r, [f"{NA} — no mapped customer has a Shopify order yet.", "", "", "", "", "", "", "", "", ""])
     else:
         total_inc = 0
-        for d in order_detail:
-            status = "Earned" if d["earned"] else "Pending (threshold not met)"
-            r = _write_row(ws, r, [d["rep"], d["customer_phone"], d["order"], d["sequence"],
-                                   round(d["value"], 2), round(d["cumulative"], 2), d["incentive"], status])
+        for d in sorted(order_detail, key=lambda x: (not x["in_period"], x["rep"], x["order_date"])):
+            if not d["in_period"]:
+                status = "Outside report period — no incentive in this run"
+            elif d["earned"]:
+                status = "Earned"
+            else:
+                status = "Pending (threshold not met)"
+            r = _write_row(ws, r, [d["rep"], d["customer_phone"], d["order"], d["order_date"],
+                                   "YES" if d["in_period"] else "no", d["sequence"],
+                                   round(d["value"], 2), round(d["cumulative"], 2),
+                                   d["incentive"], status])
             total_inc += d["incentive"]
-        r = _write_row(ws, r, ["TOTAL pending order incentive", "", "", "", "", "", total_inc, ""],
-                       fonts=[HEAD_FONT] * 8, fill=HEAD_FILL)
+        r = _write_row(ws, r, ["TOTAL order incentive for THIS period", "", "", "", "", "", "", "", total_inc, ""],
+                       fonts=[HEAD_FONT] * 10, fill=HEAD_FILL)
 
     r += 1
     unattr = conn.execute(
@@ -551,6 +566,12 @@ def build_methodology_sheet(wb, conn, config, start, end, explicit, period_label
                                              "stated formula, so they are NOT reproduced here. Instead each rep's "
                                              "sheet reports the underlying verifiable facts (e.g. 'late on 6 of 8 "
                                              "rating days'), which are auditable."),
+        ("Order incentive date scoping", "The tier (1st/2nd/3rd) is a LIFETIME position, so sequence and cumulative "
+                                         "are computed over the customer's full order history. But incentive is only "
+                                         "AWARDED for orders placed INSIDE this report period — an order from a "
+                                         "previous month belongs to that month's payroll and must not be paid twice. "
+                                         "Out-of-period orders are listed on the Order Attribution sheet (marked "
+                                         "'no' under In Period?) purely so the sequence is auditable."),
         ("WHY ITEMS ARE NOT AVAILABLE", ""),
         ("Part-time call-based pay", f"valid_call_definition is UNSET in payroll_config.json. Rs-per-call pay is either "
                                      f"per connected-call (>45s) or per outgoing attempt — a materially different "
@@ -589,8 +610,15 @@ def build_methodology_sheet(wb, conn, config, start, end, explicit, period_label
         r += 1
 
 
+def load_config():
+    """Also used by chat_web.py's Payroll tab status check, so the UI and the
+    report always read the same contract terms from the same file."""
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def generate_report_file():
-    config = json.load(open(CONFIG_PATH, encoding="utf-8"))
+    config = load_config()
     conn = get_connection()
     try:
         wb = build_workbook(conn, config)
