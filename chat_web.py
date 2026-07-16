@@ -27,7 +27,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import chat_query
 from common import get_connection, now_iso
 import ingest_callyzer
-from payroll import ingest_never_attended, ingest_customer_map, generate_report as payroll_report
+from payroll import (ingest_never_attended, ingest_customer_map,
+                     generate_report as payroll_report, offer_letters)
 
 PORT = 5050
 
@@ -150,9 +151,23 @@ PAGE_HTML = r"""<!DOCTYPE html>
   .channel-tag { font-size: 11px; color: #475569; background: #f1f5f9; border-radius: 10px; padding: 2px 9px; white-space: nowrap; }
   .report-row { display: flex; align-items: center; gap: 14px; padding: 8px 0; border-bottom: 1px solid #f1f5f9; }
   .report-row:last-child { border-bottom: none; }
-  #generate-btn { background: #2563eb; color: #fff; border: none; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; }
-  #generate-btn:hover { background: #1d4ed8; }
-  #generate-btn:disabled { opacity: 0.6; cursor: default; }
+  #generate-btn, #save-terms-btn { background: #2563eb; color: #fff; border: none; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; }
+  #generate-btn:hover, #save-terms-btn:hover { background: #1d4ed8; }
+  #generate-btn:disabled, #save-terms-btn:disabled { opacity: 0.6; cursor: default; }
+
+  /* Payroll input rows (each row carries its own upload) */
+  .pr-row { display: flex; align-items: flex-start; gap: 14px; padding: 14px 16px; border-bottom: 1px solid #f1f5f9; transition: background 0.15s; }
+  .pr-row:last-child { border-bottom: none; }
+  .pr-row.pr-needed { background: #fff7ed; }
+  .pr-row.dragover { background: #eff6ff; outline: 2px dashed #2563eb; outline-offset: -2px; }
+  .pr-badge { padding-top: 2px; }
+  .pr-main { flex: 1; min-width: 0; }
+  .pr-name { font-weight: 600; font-size: 14px; color: #0f172a; }
+  .pr-detail { font-size: 12px; color: #475569; margin-top: 2px; }
+  .pr-hint { font-size: 11px; color: #94a3b8; margin-top: 3px; }
+  .pr-action { flex-shrink: 0; }
+  .ol-text { white-space: pre-wrap; font-family: 'Segoe UI', sans-serif; font-size: 12px; color: #334155; max-height: 340px; overflow: auto; margin: 0; }
+  .payroll-status-row { display: flex; align-items: center; gap: 12px; padding: 8px 0; }
 
   /* Loading / error */
   .loading { text-align: center; padding: 48px; color: #94a3b8; font-size: 14px; }
@@ -290,7 +305,7 @@ function switchTab(name) {
   document.getElementById('chat-panel').classList.toggle('active', name==='chat');
   document.getElementById('payroll-panel').classList.toggle('active', name==='payroll');
   if (name==='chat') document.getElementById('question').focus();
-  if (name==='payroll') { payrollFlash = null; loadPayroll(); }
+  if (name==='payroll') { payrollFlash = null; payrollLetterText = null; loadPayroll(); }
 }
 
 // ─── Dashboard ──────────────────────────────────────────
@@ -537,6 +552,7 @@ async function uploadCallyzerFile(file) {
 // Survives the full-panel re-render that loadPayroll() does, so an upload
 // or generate result stays on screen instead of flashing away. {ok, text}.
 let payrollFlash = null;
+let payrollLetterText = null;  // extracted offer-letter text, shown until you leave the tab
 
 async function loadPayroll() {
   const el = document.getElementById('payroll-content');
@@ -563,22 +579,52 @@ function renderPayroll(d) {
       <span style="font-weight:700">${icon}</span><span>${payrollFlash.text}</span>
     </div>`;
   }
-  const channelTag = {
-    chat: 'Chat tab upload', payroll: 'drop below', api: 'Shopify auto-sync',
-    config: 'payroll_config.json', derived: 'auto-derived',
+  // Each input carries its own action, so the status and the upload control
+  // are never two disconnected lists you have to mentally join.
+  const ACTIONS = {
+    never_attended: { key: 'na', label: 'Upload CSV', accept: '.csv,text/csv', hint: 'Callyzer "Never Attended Report" export (.csv)' },
+    customer_map:   { key: 'cm', label: 'Upload CSV', accept: '.csv,text/csv', hint: 'Mapping CSV (Customer Name / Customer Phone / Salesperson) OR a Callyzer Lead Data Report (.csv)' },
+    offer_letter:   { key: 'ol', label: 'Upload PDF', accept: '.pdf,application/pdf', hint: 'Offer letter / agreement (.pdf)' },
   };
+  const CHANNEL_NOTE = {
+    chat: 'Uploaded on the Chat tab',
+    api: 'Automatic — Shopify sync, nothing to upload',
+    derived: 'Automatic — derived from call history',
+  };
+
   function inputRow(r) {
+    const act = r.endpoint ? ACTIONS[r.endpoint] : null;
+    let action = '';
+    if (act) {
+      action = `
+        <div class="pr-action">
+          <input type="file" id="${act.key}-input" accept="${act.accept}" style="display:none"
+                 onchange="handlePayrollInputChange(event,'${act.key}')">
+          <button class="secondary-btn" onclick="document.getElementById('${act.key}-input').click()">${act.label}</button>
+        </div>`;
+    } else {
+      action = `<div class="pr-action"><span class="channel-tag">${CHANNEL_NOTE[r.channel] || r.channel}</span></div>`;
+    }
     return `
-      <div class="payroll-status-row">
-        <span class="badge ${r.satisfied ? 'high' : 'low'}">${r.satisfied ? 'Ready' : 'Needed'}</span>
-        <strong>${r.name}</strong>
-        <span class="channel-tag">${channelTag[r.channel] || r.channel}</span>
-        <span class="target-sub">${r.detail}</span>
+      <div class="pr-row ${r.satisfied ? '' : 'pr-needed'}" ${act ? `id="${act.key}-card"
+           ondragover="handlePayrollDragOver(event,'${act.key}')"
+           ondragleave="handlePayrollDragLeave(event,'${act.key}')"
+           ondrop="handlePayrollDrop(event,'${act.key}')"` : ''}>
+        <div class="pr-badge"><span class="badge ${r.satisfied ? 'high' : 'low'}">${r.satisfied ? 'Ready' : 'Needed'}</span></div>
+        <div class="pr-main">
+          <div class="pr-name">${r.name}</div>
+          <div class="pr-detail">${r.detail}</div>
+          ${act ? `<div class="pr-hint">Accepts: ${act.hint}</div>` : ''}
+          <div class="upload-status" id="${act ? act.key : 'x'}-status"></div>
+        </div>
+        ${action}
       </div>`;
   }
+
   const perfRows = inputs.filter(r => r.group === 'Performance').map(inputRow).join('');
   const salaryRows = inputs.filter(r => r.group === 'Salary').map(inputRow).join('');
   const readyCount = inputs.filter(r => r.satisfied).length;
+  const blockers = inputs.filter(r => !r.satisfied).map(r => r.name);
 
   const reportsHtml = d.reports.length ? d.reports.map(r => `
     <div class="report-row">
@@ -587,39 +633,69 @@ function renderPayroll(d) {
       <a href="/payroll/download/${encodeURIComponent(r.name)}" class="secondary-btn" style="text-decoration:none;display:inline-block;padding:6px 14px;">Download</a>
     </div>`).join('') : '<div class="target-sub">No reports generated yet.</div>';
 
+  const lettersHtml = (d.offer_letters || []).length
+    ? (d.offer_letters || []).map(l => `<div class="report-row"><span>📄 ${l.name}</span>
+        <span class="target-sub">${l.uploaded_at} · ${l.size_kb} KB</span></div>`).join('')
+    : '<div class="target-sub">No offer letter uploaded. Optional — it is only the audit-trail source document; the terms the report uses are the ones set below.</div>';
+
+  // Contract terms form — the values the report actually computes from.
+  const vcd = d.valid_call_definition;
+  const vcdOptions = (d.valid_call_options || []).map(o =>
+    `<option value="${o}" ${vcd === o ? 'selected' : ''}>${o}</option>`).join('');
+  const termsRows = (d.employee_terms || []).map(e => `
+    <tr>
+      <td><strong>${e.name}</strong></td>
+      <td>
+        <select id="et-type-${e.name}">
+          <option value="full_time" ${e.employment_type === 'full_time' ? 'selected' : ''}>full_time</option>
+          <option value="part_time" ${e.employment_type === 'part_time' ? 'selected' : ''}>part_time</option>
+        </select>
+      </td>
+      <td><input type="number" min="0" step="1" id="et-fixed-${e.name}" value="${e.fixed_salary ?? ''}" placeholder="—" style="width:110px"></td>
+      <td><input type="number" min="0" step="0.5" id="et-rate-${e.name}" value="${e.per_call_rate ?? ''}" placeholder="—" style="width:90px"></td>
+      <td><input type="checkbox" id="et-prob-${e.name}" ${e.probation ? 'checked' : ''}></td>
+    </tr>`).join('');
+
   document.getElementById('payroll-content').innerHTML = `
     ${flashHtml}
     <div class="section-title">Payroll / Combined Audit Report</div>
-    <div class="freshness-note">Mirrors MasonMart_Combined_Audit_Salary_Jun2026.xlsx — the 7 inputs below are exactly what that report was built from. ${readyCount} of ${inputs.length} ready.</div>
+    <div class="freshness-note">
+      Mirrors MasonMart_Combined_Audit_Salary_Jun2026.xlsx — the 7 inputs below are exactly what that report is built from.
+      <strong>${readyCount} of ${inputs.length} ready.</strong>
+      ${blockers.length ? ` Still needed: ${blockers.join(', ')}.` : ''}
+    </div>
 
     <div class="section-title" style="margin-top:20px">Performance Inputs</div>
-    <div class="table-wrap" style="padding:16px">${perfRows}</div>
+    <div class="table-wrap">${perfRows}</div>
     <div class="section-title" style="margin-top:16px">Salary Inputs</div>
-    <div class="table-wrap" style="padding:16px">${salaryRows}</div>
+    <div class="table-wrap">${salaryRows}</div>
 
-    <div class="section-title" style="margin-top:20px">Drop Reports</div>
-    <div class="upload-card" id="na-upload-card" ondragover="handlePayrollDragOver(event,'na')" ondragleave="handlePayrollDragLeave(event,'na')" ondrop="handlePayrollDrop(event,'na')">
-      <div class="upload-copy">
-        <strong>Never Attended Report</strong>
-        <span>Drop the Callyzer "Never Attended Report" CSV export here.</span>
+    <div class="section-title" style="margin-top:20px">Contract terms — what the report actually uses</div>
+    <div class="table-wrap" style="padding:16px">
+      <div class="pr-hint" style="margin-bottom:10px">
+        Terms are never auto-parsed from a PDF — a misread clause becomes a wrong number on someone's payslip.
+        Read the uploaded letter, then set the terms here.
       </div>
-      <div class="upload-actions">
-        <input type="file" id="na-input" accept=".csv,text/csv" style="display:none" onchange="handlePayrollInputChange(event,'na')">
-        <button class="secondary-btn" onclick="document.getElementById('na-input').click()">Choose CSV</button>
-        <div class="upload-status" id="na-status"></div>
+      <div style="margin-bottom:14px">
+        <label style="font-size:13px"><strong>"Valid call" definition</strong>
+          ${vcd ? '' : '<span class="badge low" style="margin-left:6px">blocks part-time pay</span>'}
+        </label><br>
+        <select id="vcd-select" style="margin-top:6px;min-width:230px">
+          <option value="" ${vcd ? '' : 'selected'}>— not set —</option>
+          ${vcdOptions}
+        </select>
+        <div class="pr-hint">connected_45s = pay per connected call &gt;45s · any_outgoing_attempt = pay per outgoing attempt. These give very different pay — confirm against the agreement.</div>
       </div>
+      <table style="width:auto">
+        <thead><tr><th>Employee</th><th>Type</th><th>Fixed salary (₹)</th><th>Per-call rate (₹)</th><th>Probation</th></tr></thead>
+        <tbody>${termsRows}</tbody>
+      </table>
+      <button id="save-terms-btn" onclick="savePayrollTerms()" style="margin-top:12px">Save contract terms</button>
     </div>
-    <div class="upload-card" id="cm-upload-card" ondragover="handlePayrollDragOver(event,'cm')" ondragleave="handlePayrollDragLeave(event,'cm')" ondrop="handlePayrollDrop(event,'cm')">
-      <div class="upload-copy">
-        <strong>Customer → Salesperson Mapping</strong>
-        <span>Drop a CSV with columns Customer Name / Customer Phone / Salesperson, OR a Callyzer Lead Data Report export (uses its Assign To field — see payroll/README.md for the caveat on that source).</span>
-      </div>
-      <div class="upload-actions">
-        <input type="file" id="cm-input" accept=".csv,text/csv" style="display:none" onchange="handlePayrollInputChange(event,'cm')">
-        <button class="secondary-btn" onclick="document.getElementById('cm-input').click()">Choose CSV</button>
-        <div class="upload-status" id="cm-status"></div>
-      </div>
-    </div>
+
+    <div class="section-title" style="margin-top:20px">Offer letters on file (audit trail)</div>
+    <div class="table-wrap" style="padding:16px">${lettersHtml}</div>
+    <div id="ol-text-wrap"></div>
 
     <div class="section-title" style="margin-top:20px">Generate & Download</div>
     <div style="padding:0 16px 16px">
@@ -628,19 +704,65 @@ function renderPayroll(d) {
     </div>
     <div class="table-wrap" style="padding:16px">${reportsHtml}</div>
   `;
+
+  if (payrollLetterText) {
+    document.getElementById('ol-text-wrap').innerHTML = `
+      <div class="section-title" style="margin-top:16px">Extracted text — read it, then set the terms above</div>
+      <div class="table-wrap" style="padding:16px">
+        <pre class="ol-text">${payrollLetterText.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</pre>
+      </div>`;
+  }
 }
+
+async function savePayrollTerms() {
+  const btn = document.getElementById('save-terms-btn');
+  btn.disabled = true;
+  const vcdRaw = document.getElementById('vcd-select').value;
+  const updates = { employees: {} };
+  if (vcdRaw) updates.valid_call_definition = vcdRaw;
+  document.querySelectorAll('[id^="et-type-"]').forEach(el => {
+    const name = el.id.replace('et-type-', '');
+    const fixed = document.getElementById(`et-fixed-${name}`).value;
+    const rate = document.getElementById(`et-rate-${name}`).value;
+    updates.employees[name] = {
+      employment_type: el.value,
+      fixed_salary: fixed === '' ? null : Number(fixed),
+      per_call_rate: rate === '' ? null : Number(rate),
+      probation: document.getElementById(`et-prob-${name}`).checked,
+    };
+  });
+  try {
+    const resp = await fetch('/payroll/set-config', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(updates),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.message || 'Save failed');
+    payrollFlash = { ok: true, text: data.message + (vcdRaw ? '' : ' Note: "valid call" definition is still not set, so part-time pay stays blocked.') };
+  } catch (e) {
+    payrollFlash = { ok: false, text: `Could not save contract terms. ${e.message || e}` };
+  }
+  btn.disabled = false;
+  await loadPayroll();
+}
+
+const PAYROLL_KIND = {
+  na: { endpoint: '/payroll/upload-never-attended', label: 'Never Attended Report' },
+  cm: { endpoint: '/payroll/upload-customer-map', label: 'Customer mapping' },
+  ol: { endpoint: '/payroll/upload-offer-letter', label: 'Offer letter' },
+};
 
 function handlePayrollDragOver(event, kind) {
   event.preventDefault();
-  document.getElementById(`${kind}-upload-card`)?.classList.add('dragover');
+  document.getElementById(`${kind}-card`)?.classList.add('dragover');
 }
 function handlePayrollDragLeave(event, kind) {
   event.preventDefault();
-  document.getElementById(`${kind}-upload-card`)?.classList.remove('dragover');
+  document.getElementById(`${kind}-card`)?.classList.remove('dragover');
 }
 function handlePayrollDrop(event, kind) {
   event.preventDefault();
-  document.getElementById(`${kind}-upload-card`)?.classList.remove('dragover');
+  document.getElementById(`${kind}-card`)?.classList.remove('dragover');
   const file = event.dataTransfer?.files?.[0];
   if (file) uploadPayrollFile(file, kind);
 }
@@ -650,19 +772,20 @@ function handlePayrollInputChange(event, kind) {
   event.target.value = '';
 }
 async function uploadPayrollFile(file, kind) {
+  const cfg = PAYROLL_KIND[kind];
+  if (!cfg) return;
   const statusEl = document.getElementById(`${kind}-status`);
-  const label = kind === 'na' ? 'Never Attended Report' : 'Customer mapping';
-  const endpoint = kind === 'na' ? '/payroll/upload-never-attended' : '/payroll/upload-customer-map';
   if (statusEl) { statusEl.style.color = '#64748b'; statusEl.textContent = `Uploading ${file.name}…`; }
   const form = new FormData();
   form.append('file', file, file.name);
   try {
-    const resp = await fetch(endpoint, { method: 'POST', body: form });
+    const resp = await fetch(cfg.endpoint, { method: 'POST', body: form });
     const data = await resp.json();
     if (!resp.ok || !data.ok) throw new Error(data.message || 'Upload failed');
-    payrollFlash = { ok: true, text: `${label} — ${file.name}: ${data.message}` };
+    payrollFlash = { ok: true, text: `${cfg.label} — ${file.name}: ${data.message}` };
+    payrollLetterText = data.extracted_text || (kind === 'ol' ? payrollLetterText : null);
   } catch (e) {
-    payrollFlash = { ok: false, text: `${label} — ${file.name} was NOT ingested. ${e.message || e}` };
+    payrollFlash = { ok: false, text: `${cfg.label} — ${file.name} was NOT accepted. ${e.message || e}` };
   }
   await loadPayroll();  // re-render so the Ready/Needed badges AND the flash update together
 }
@@ -1009,6 +1132,16 @@ def _payroll_status():
             else (e.get("per_call_rate") is not None)
             for e in employees.values()
         )
+        letters = offer_letters.list_offer_letters()
+        # Terms the Contract-terms form edits, so the UI never has to guess
+        # what's currently set.
+        employee_terms = [
+            {"name": n, "employment_type": e.get("employment_type"),
+             "fixed_salary": e.get("fixed_salary"), "per_call_rate": e.get("per_call_rate"),
+             "probation": e.get("probation", False)}
+            for n, e in employees.items()
+        ]
+        period_cfg = config.get("period", {})
     finally:
         conn.close()
 
@@ -1046,11 +1179,14 @@ def _payroll_status():
                 f"not a confirmed conversion — review before trusting for payout)" if customer_map_lead_n else "")
          ) if customer_map_n else "No mappings yet — drop a CSV below (Shopify orders carry no salesperson tag)."},
         {"group": "Salary", "name": "Offer Letters / Agreements",
-         "channel": "config", "satisfied": offer_terms_ok,
-         "detail": ("Salary terms captured in payroll_config.json"
-                    + ("" if valid_call_definition
-                       else " — but \"valid call\" definition still UNSET (blocks part-time pay).")
-                    ) if offer_terms_ok else "Salary terms missing in payroll_config.json."},
+         "channel": "payroll", "endpoint": "offer_letter", "satisfied": offer_terms_ok,
+         "detail": (
+             (f"{len(letters)} document(s) on file. " if letters else "No document uploaded (optional — it's the "
+              "audit-trail source; the terms below are what the report actually uses). ")
+             + ("Terms captured" if offer_terms_ok else "⚠ Terms MISSING in payroll_config.json")
+             + ("" if valid_call_definition else " — and \"valid call\" definition is UNSET, which blocks "
+                "part-time pay. Set it under Contract terms below.")
+         )},
     ]
 
     reports = []
@@ -1070,20 +1206,48 @@ def _payroll_status():
 
     return {
         "valid_call_definition": valid_call_definition,
+        "valid_call_options": list(payroll_report.VALID_CALL_OPTIONS),
         "never_attended_rows": never_attended_n,
         "customer_map_rows": customer_map_n,
         "inputs": inputs,
         "reports": reports,
+        "offer_letters": letters,
+        "employee_terms": employee_terms,
+        "period": {"start_date": period_cfg.get("start_date"), "end_date": period_cfg.get("end_date")},
     }
 
 
 def _payroll_upload(headers, body, kind):
-    """kind: 'never_attended' or 'customer_map'. Shares the same multipart
-    parsing as the Callyzer upload — see _parse_uploaded_file."""
+    """kind: 'never_attended' | 'customer_map' | 'offer_letter'.
+    Shares the same multipart parsing as the Callyzer upload — see
+    _parse_uploaded_file. Every path returns a dict with ok/message so the UI
+    can always say something concrete; nothing fails silently."""
     filename, file_bytes = _parse_uploaded_file(headers, body)
-    safe_name = os.path.basename(filename or "upload.csv")
-    if not safe_name.lower().endswith(".csv"):
-        raise ValueError("Please upload a CSV file.")
+    safe_name = os.path.basename(filename or "upload")
+    ext = os.path.splitext(safe_name)[1].lower()
+
+    if kind == "offer_letter":
+        if ext != ".pdf":
+            return {"ok": False, "message": (
+                f"'{safe_name}' is a {ext or 'file with no extension'} — the Offer Letters slot takes a "
+                f"PDF. (Tip: the other two slots take CSV exports, not PDFs.)")}
+        path = offer_letters.save_offer_letter(safe_name, file_bytes)
+        text, err = offer_letters.extract_text(path)
+        if err and text is None:
+            return {"ok": False, "message": f"{safe_name} was saved, but its text could not be read: {err}"}
+        if err:
+            return {"ok": True, "message": f"{safe_name} saved ({len(file_bytes)//1024} KB). {err}",
+                    "extracted_text": text}
+        return {"ok": True,
+                "message": (f"{safe_name} saved ({len(file_bytes)//1024} KB) and its text was read "
+                            f"({len(text):,} chars). Read the terms below, then set them in "
+                            f"'Contract terms' — they are never auto-parsed from the PDF."),
+                "extracted_text": text}
+
+    if ext != ".csv":
+        return {"ok": False, "message": (
+            f"'{safe_name}' is a {ext or 'file with no extension'} — this slot takes a CSV export. "
+            f"If this is an offer letter/agreement, use the Offer Letters slot instead (it takes PDFs).")}
 
     payroll_dir = os.path.dirname(os.path.abspath(payroll_report.__file__))
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -1266,14 +1430,32 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif self.path in ("/payroll/upload-never-attended", "/payroll/upload-customer-map"):
-            kind = "never_attended" if self.path.endswith("never-attended") else "customer_map"
+        elif self.path in ("/payroll/upload-never-attended", "/payroll/upload-customer-map",
+                            "/payroll/upload-offer-letter"):
+            kind = {"/payroll/upload-never-attended": "never_attended",
+                    "/payroll/upload-customer-map": "customer_map",
+                    "/payroll/upload-offer-letter": "offer_letter"}[self.path]
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length)
             try:
                 result = _payroll_upload(self.headers, raw, kind)
                 body = json.dumps(result).encode("utf-8")
                 self.send_response(200 if result.get("ok") else 400)
+            except Exception as e:
+                body = json.dumps({"ok": False, "message": str(e)}).encode("utf-8")
+                self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/payroll/set-config":
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length)
+            try:
+                updates = json.loads(raw)
+                payroll_report.save_config_values(updates)
+                body = json.dumps({"ok": True, "message": "Contract terms saved to payroll_config.json."}).encode("utf-8")
+                self.send_response(200)
             except Exception as e:
                 body = json.dumps({"ok": False, "message": str(e)}).encode("utf-8")
                 self.send_response(400)

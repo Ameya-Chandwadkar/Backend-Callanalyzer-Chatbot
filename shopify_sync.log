@@ -98,4 +98,19 @@ Done. 1 order(s) upserted. Next run will fetch orders updated after 2026-07-14T1
 [15-07-2026 21:24:04.05] Done, exit code 0 
 [15-07-2026 23:37:03.51] Running Shopify sync 
 [15-07-2026 23:39:02.41] Running Shopify sync 
-^C
+^C[15-07-2026 23:54:04.18] Running Shopify sync 
+Requesting access token via client credentials grant...
+Fetching orders updated after 2026-07-14T15:14:06Z ...
+Done. 1 order(s) upserted. Next run will fetch orders updated after 2026-07-14T15:14:06Z.
+[15-07-2026 23:54:07.86] Done, exit code 0 
+[16-07-2026 14:33:52.66] Running Shopify sync 
+Requesting access token via client credentials grant...
+Fetching orders updated after 2026-07-14T15:14:06Z ...
+Done. 4 order(s) upserted. Next run will fetch orders updated after 2026-07-16T06:33:44Z.
+[16-07-2026 14:34:02.07] Done, exit code 0 
+[16-07-2026 14:39:02.69] Running Shopify sync 
+^C[16-07-2026 14:54:05.98] Running Shopify sync 
+Requesting access token via client credentials grant...
+Fetching orders updated after 2026-07-16T06:33:44Z ...
+Done. 1 order(s) upserted. Next run will fetch orders updated after 2026-07-16T06:33:44Z.
+[16-07-2026 14:54:08.33] Done, exit code 0 

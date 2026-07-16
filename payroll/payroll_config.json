@@ -15,17 +15,19 @@
     "roughly 6x depending on the answer. Set it to 'connected_45s' or",
     "'any_outgoing_attempt' before running payroll for real."
   ],
-
   "period": {
     "start_date": null,
     "end_date": null,
-    "excluded_weekdays": ["Sunday"],
+    "excluded_weekdays": [
+      "Sunday"
+    ],
     "_note": "start_date/end_date in YYYY-MM-DD. excluded_weekdays are dropped from every working-day count, matching the June audit's 'Sundays excluded' rule."
   },
-
-  "valid_call_definition": null,
-  "_valid_call_definition_options": ["connected_45s", "any_outgoing_attempt"],
-
+  "valid_call_definition": "connected_45s",
+  "_valid_call_definition_options": [
+    "connected_45s",
+    "any_outgoing_attempt"
+  ],
   "order_incentive_tiers": {
     "1st": 500,
     "2nd": 250,
@@ -41,14 +43,12 @@
     "min_qualified_customers": 10,
     "_note": "A rep needs more than this many qualified customers (3rd order + min_order_value) in the period to earn any target bonus. Amount is per-rep, see employees below."
   },
-
   "employees": {
     "_note": "Key = canonical_name exactly as it appears in the reps table (run rebuild_rep_directory.py first if unsure). rep_sim_number is filled in automatically by generate_report.py from the reps table — leave it null here.",
-
     "sara": {
       "rep_sim_number": null,
       "employment_type": "full_time",
-      "fixed_salary": 10000,
+      "fixed_salary": 10000.0,
       "per_call_rate": null,
       "probation": true,
       "discipline_rules_applicable": true,
@@ -59,7 +59,7 @@
     "suman": {
       "rep_sim_number": null,
       "employment_type": "full_time",
-      "fixed_salary": 10000,
+      "fixed_salary": 10000.0,
       "per_call_rate": null,
       "probation": true,
       "discipline_rules_applicable": true,
@@ -71,7 +71,7 @@
       "rep_sim_number": null,
       "employment_type": "part_time",
       "fixed_salary": null,
-      "per_call_rate": 5,
+      "per_call_rate": 5.0,
       "probation": false,
       "discipline_rules_applicable": false,
       "target_bonus_amount": 0,
@@ -82,7 +82,7 @@
       "rep_sim_number": null,
       "employment_type": "part_time",
       "fixed_salary": null,
-      "per_call_rate": 5,
+      "per_call_rate": 5.0,
       "probation": false,
       "discipline_rules_applicable": false,
       "target_bonus_amount": 0,
@@ -90,7 +90,6 @@
       "form_bonus_amount": null
     }
   },
-
   "discipline_rules": {
     "_note": "Only applied to employees with discipline_rules_applicable=true (full-time, per the June audit).",
     "first_call_deadline": "09:10",
@@ -107,7 +106,6 @@
     },
     "rating_day_min_attempts": 50
   },
-
   "gold_lead": {
     "response_target_minutes": 30,
     "_note": "First outgoing call to a Gold Lead must land within this many minutes of lead assignment (callyzer_leads.created_date) to 'pass'. June audit marks this PROVISIONAL — the Gold Lead tag carries a date but no time, so the check is indicative only until Callyzer exports assignment time precisely."

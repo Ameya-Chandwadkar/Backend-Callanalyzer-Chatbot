@@ -617,6 +617,68 @@ def load_config():
         return json.load(f)
 
 
+VALID_CALL_OPTIONS = ("connected_45s", "any_outgoing_attempt")
+
+
+def save_config_values(updates):
+    """Write specific config values from the Payroll tab's form, preserving
+    everything else in the file (including the _readme comments).
+
+    Only whitelisted keys are writable — the UI must never be able to corrupt
+    the contract terms into an unparseable state. Raises ValueError on bad
+    input rather than silently writing something wrong to a file that decides
+    people's pay.
+    """
+    config = load_config()
+
+    if "valid_call_definition" in updates:
+        v = updates["valid_call_definition"]
+        if v not in VALID_CALL_OPTIONS:
+            raise ValueError(f"valid_call_definition must be one of {VALID_CALL_OPTIONS}, got {v!r}")
+        config["valid_call_definition"] = v
+
+    if "period" in updates:
+        p = updates["period"] or {}
+        for key in ("start_date", "end_date"):
+            if key in p:
+                val = (p[key] or "").strip() or None
+                if val is not None:
+                    try:
+                        datetime.strptime(val, "%Y-%m-%d")
+                    except ValueError:
+                        raise ValueError(f"{key} must be YYYY-MM-DD, got {val!r}")
+                config["period"][key] = val
+
+    for name, emp_updates in (updates.get("employees") or {}).items():
+        if name not in config.get("employees", {}) or name.startswith("_"):
+            raise ValueError(f"Unknown employee {name!r}")
+        emp = config["employees"][name]
+        for key in ("fixed_salary", "per_call_rate"):
+            if key in emp_updates:
+                raw = emp_updates[key]
+                if raw in (None, "",):
+                    emp[key] = None
+                else:
+                    try:
+                        num = float(raw)
+                    except (TypeError, ValueError):
+                        raise ValueError(f"{name}.{key} must be a number, got {raw!r}")
+                    if num < 0:
+                        raise ValueError(f"{name}.{key} cannot be negative")
+                    emp[key] = num
+        if "employment_type" in emp_updates:
+            et = emp_updates["employment_type"]
+            if et not in ("full_time", "part_time"):
+                raise ValueError(f"{name}.employment_type must be full_time or part_time")
+            emp["employment_type"] = et
+        if "probation" in emp_updates:
+            emp["probation"] = bool(emp_updates["probation"])
+
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    return config
+
+
 def generate_report_file():
     config = load_config()
     conn = get_connection()
