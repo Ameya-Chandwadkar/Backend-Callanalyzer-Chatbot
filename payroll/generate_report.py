@@ -77,7 +77,7 @@ def _write_row(ws, r, values, fonts=None, fill=None, borders=True):
 
 # ── Salary computation (per rep) ─────────────────────────────
 
-def compute_salary(conn, config, emp, ct, sub_days, order_incentive):
+def compute_salary(conn, config, emp, ct, sub_days, order_incentive, rep_sim):
     """Returns a list of (component, amount_or_NA, how, source, basis) rows,
     plus a 'payable_now' summary value."""
     vcd = config.get("valid_call_definition")
@@ -119,11 +119,12 @@ def compute_salary(conn, config, emp, ct, sub_days, order_incentive):
             blocked = True
         else:
             count = ct["connected_45s"] if vcd == "connected_45s" else ct["outgoing"]
+            basis_txt = ("connected calls >45s (incoming AND outgoing)" if vcd == "connected_45s"
+                         else "outgoing attempts")
             pay = round(count * rate, 2)
             rows.append(("Call-Based Pay", pay,
-                         f"{count} {'connected calls >45s' if vcd=='connected_45s' else 'outgoing attempts'} "
-                         f"x Rs {rate} = Rs {pay}.",
-                         "Call History", f"Rs {rate} per valid call ({vcd})."))
+                         f"{count} {basis_txt} x Rs {rate} = Rs {pay}.",
+                         "Call History", f"Rs {rate} per valid call, where valid call = {vcd}."))
             payable_parts.append(pay)
 
     # LOP risk — info only, never deducted
@@ -148,11 +149,13 @@ def compute_salary(conn, config, emp, ct, sub_days, order_incentive):
                  "Customer map + Orders",
                  f"Earned only at order #{qual['min_order_sequence']} + Rs {qual['min_order_value']:,}."))
 
-    # Target bonus
+    # Target bonus — qualified count is COMPUTED, not assumed.
     bonus = emp.get("target_bonus_amount", 0)
-    rows.append(("Target Bonus", bonus,
-                 f"Needs > {config['target_bonus']['min_qualified_customers']} qualified customers "
-                 f"(order #{qual['min_order_sequence']} + Rs {qual['min_order_value']:,}). Current qualified = 0.",
+    qualified = metrics.qualified_customer_count(conn, config, rep_sim) if rep_sim else 0
+    need = config["target_bonus"]["min_qualified_customers"]
+    rows.append(("Target Bonus", bonus if qualified > need else 0,
+                 f"Rep has {qualified} qualified customer(s) (>= {qual['min_order_sequence']} orders with "
+                 f"cumulative >= Rs {qual['min_order_value']:,}); needs more than {need} to earn the bonus.",
                  "Customer map + Orders", "Monthly target bonus."))
 
     # Feedback / form
@@ -186,7 +189,7 @@ def performance_rows(conn, config, sim, start, end):
     exc = config["period"]["excluded_weekdays"]
     dr = config["discipline_rules"]
     min_att = dr["rating_day_min_attempts"]
-    ct = metrics.call_totals(conn, sim, start, end)
+    ct = metrics.call_totals(conn, sim, start, end, exc)
     rdays = metrics.rating_days(conn, sim, start, end, min_att, exc)
     sub = metrics.sub_threshold_days(conn, sim, start, end, min_att, exc)
 
@@ -196,11 +199,13 @@ def performance_rows(conn, config, sim, start, end):
     rows.append(("Incoming calls", ct["incoming"] or 0,
                  "Count of incoming calls in the period.", "Call History", "—"))
     rows.append(("Connected calls (>45s)", ct["connected_45s"] or 0,
-                 "Calls with talk duration over 45 seconds.", "Call History", "Connected-call definition (>45s)."))
+                 "Count of calls (incoming AND outgoing) with talk duration over 45 seconds.",
+                 "Call History", "Connected-call definition (>45s), all calls."))
     rows.append(("Talk time", metrics.fmt_talk(ct["talk_seconds"]),
-                 "Sum of all call durations.", "Call History", "Total talk time."))
+                 "Sum of all call durations (incoming and outgoing).", "Call History", "Total talk time."))
     rows.append(("Active / Rating days", f"{ct['active_days']} active / {len(rdays)} rating",
-                 f"Active = working days with any activity; Rating = days with {min_att}+ outgoing attempts.",
+                 f"Active = WORKING days (excl. {', '.join(exc)}) with any activity; "
+                 f"Rating = working days with {min_att}+ outgoing attempts.",
                  "Call History", f"Rating day = {min_att}+ attempts (excl. {', '.join(exc)})."))
 
     disc_applicable = emp_is_disc(config, sim)
@@ -284,6 +289,48 @@ def _annotated_table(ws, r, headers, rows):
     return r
 
 
+COVERAGE_FILL = PatternFill("solid", fgColor="FEF3C7")   # soft amber, hard to miss
+COVERAGE_BORDER = Border(left=Side(style="medium", color="F59E0B"),
+                         right=Side(style="medium", color="F59E0B"),
+                         top=Side(style="medium", color="F59E0B"),
+                         bottom=Side(style="medium", color="F59E0B"))
+
+
+def _coverage_line(cov):
+    """One compact human line naming each source's real span — for the top of
+    every sheet, so the reader instantly sees what data the numbers rest on."""
+    bits = []
+    for c in cov:
+        if c["rows"] == 0:
+            bits.append(f"{c['source']}: none uploaded")
+            continue
+        span = (f"{c['date_from']} to {c['date_to']}" if c["date_from"] else "no dates")
+        flag = ""
+        if c["aligns"] is False:
+            flag = "  [DIFFERENT PERIOD]"
+        bits.append(f"{c['source']}: {c['rows']:,} rows, {span}{flag}")
+    return "  •  ".join(bits)
+
+
+def _write_coverage_banner(ws, r, cov, ncols, period_label):
+    """A boxed amber banner spanning the sheet width: the exact data span the
+    report was built on. Appears at the top of every sheet."""
+    line1 = "DATA THIS REPORT IS ACTUALLY BUILT ON:"
+    line2 = _coverage_line(cov)
+    for (text, bold) in ((line1, True), (line2, False), (period_label, False)):
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncols)
+        cell = ws.cell(r, 1, text)
+        cell.font = Font(name=FONT, size=10, bold=bold, color="7C2D12")
+        cell.alignment = WRAP
+        cell.fill = COVERAGE_FILL
+        for c in range(1, ncols + 1):
+            ws.cell(r, c).fill = COVERAGE_FILL
+            ws.cell(r, c).border = COVERAGE_BORDER
+        ws.row_dimensions[r].height = 30 if text is line2 else 16
+        r += 1
+    return r + 1
+
+
 def build_workbook(conn, config):
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -298,10 +345,11 @@ def build_workbook(conn, config):
         emp["_resolved_rep_sim"] = row["rep_sim_number"] if row else None
 
     order_detail, incentive_by_rep, order_sources = metrics.order_incentives(conn, config, start, end)
+    cov = metrics.data_coverage(conn, start, end)
 
-    period_label = (f"Period {start} to {end}"
-                    + ("" if explicit else "  (NO period set in payroll_config.json — showing the full "
-                       "range of call data on file, not a specific pay period)")
+    period_label = (f"REPORT PERIOD: {start} to {end}"
+                    + ("" if explicit else "  (NO period set in payroll_config.json — defaulted to the full "
+                       "range of call data on file, NOT a specific calendar month)")
                     + f"  |  {', '.join(exc)} excluded -> {wdays} working days"
                     + "  |  Status: PROVISIONAL")
 
@@ -321,19 +369,19 @@ def build_workbook(conn, config):
 
         ws.cell(1, 1, f"Individual Report - {name} ({emp['employment_type'].replace('_',' ').title()})").font = TITLE_FONT
         ws.cell(2, 1, "Each line shows the value, exactly how it was calculated, the source, and the basis.").font = SUBTITLE_FONT
+        r = _write_coverage_banner(ws, 3, cov, 5, period_label)
 
         if sim is None:
-            ws.cell(4, 1, f"{NA} - '{name}' has no call history in the reps table, so nothing can be computed.").font = NA_FONT
+            ws.cell(r, 1, f"{NA} - '{name}' has no call history in the reps table, so nothing can be computed.").font = NA_FONT
             rep_cache[name] = None
             continue
 
         perf, ct, sub, rdays = performance_rows(conn, config, sim, start, end)
         incentive = incentive_by_rep.get(sim, 0.0)
-        sal, payable = compute_salary(conn, config, emp, ct, sub, incentive)
+        sal, payable = compute_salary(conn, config, emp, ct, sub, incentive, sim)
         rep_cache[name] = {"ct": ct, "sub": sub, "rdays": rdays, "incentive": incentive,
                            "payable": payable, "perf": perf, "sim": sim, "emp": emp}
 
-        r = 4
         cell = ws.cell(r, 1, "PERFORMANCE"); cell.font = SECTION_FONT; cell.fill = SECTION_FILL
         for c in range(2, 6):
             ws.cell(r, c).fill = SECTION_FILL
@@ -359,13 +407,29 @@ def build_workbook(conn, config):
 
     # ---------- Combined Summary (first sheet) ----------
     ws = wb.create_sheet("1. Combined Summary", 0)
-    ws.column_dimensions["A"].width = 20
-    for col in "BCDEFGHIJ":
+    ws.column_dimensions["A"].width = 22
+    for col in "BCD":
         ws.column_dimensions[col].width = 16
+    ws.column_dimensions["E"].width = 26
+    ws.column_dimensions["F"].width = 48
+    ws.column_dimensions["G"].width = 16
     ws.cell(1, 1, "MasonMart - Combined Performance & Salary Report").font = TITLE_FONT
-    ws.cell(2, 1, period_label).font = SUBTITLE_FONT
+    r = _write_coverage_banner(ws, 2, cov, 7, period_label)
 
-    r = 4
+    # Full data-coverage table — the exact span/rows of every source.
+    cell = ws.cell(r, 1, "DATA COVERAGE (what the numbers are actually based on)")
+    cell.font = SECTION_FONT; cell.fill = SECTION_FILL
+    for c in range(2, 8):
+        ws.cell(r, c).fill = SECTION_FILL
+    r += 1
+    r = _write_row(ws, r, ["Source", "Rows", "From", "To", "Aligns with report period?", "Note"],
+                   fonts=[HEAD_FONT] * 6, fill=HEAD_FILL)
+    for c in cov:
+        aligns = ("n/a" if c["aligns"] is None else ("YES" if c["aligns"] else "NO — different period"))
+        r = _write_row(ws, r, [c["source"], c["rows"] if c["rows"] else 0,
+                               c["date_from"] or "—", c["date_to"] or "—", aligns, c["note"]])
+    r += 2
+
     cell = ws.cell(r, 1, "A. PERFORMANCE SNAPSHOT"); cell.font = SECTION_FONT; cell.fill = SECTION_FILL
     for c in range(2, 8):
         ws.cell(r, c).fill = SECTION_FILL
@@ -416,13 +480,13 @@ def build_workbook(conn, config):
                   "'how', and the Methodology & Gaps sheet for what is intentionally left blank and why.").font = SUBTITLE_FONT
 
     # ---------- Evidence ----------
-    build_evidence_sheet(wb, conn, config, rep_cache, employees, start, end)
+    build_evidence_sheet(wb, conn, config, rep_cache, employees, start, end, cov, period_label)
 
     # ---------- Order Attribution ----------
-    build_order_sheet(wb, conn, config, order_detail, order_sources)
+    build_order_sheet(wb, conn, config, order_detail, order_sources, cov, period_label)
 
     # ---------- Methodology & Gaps ----------
-    build_methodology_sheet(wb, conn, config, start, end, explicit, period_label)
+    build_methodology_sheet(wb, conn, config, start, end, explicit, period_label, cov)
 
     return wb
 
@@ -441,14 +505,13 @@ def build_remark(name, emp, rc, config):
     return " ".join(parts)
 
 
-def build_evidence_sheet(wb, conn, config, rep_cache, employees, start, end):
+def build_evidence_sheet(wb, conn, config, rep_cache, employees, start, end, cov, period_label):
     ws = wb.create_sheet("6. Evidence")
     ws.column_dimensions["A"].width = 22
     for col in "BCDE":
-        ws.column_dimensions[col].width = 20
+        ws.column_dimensions[col].width = 22
     ws.cell(1, 1, "Supporting Evidence").font = TITLE_FONT
-
-    r = 3
+    r = _write_coverage_banner(ws, 2, cov, 5, period_label)
     cell = ws.cell(r, 1, f"Working days below {config['discipline_rules']['rating_day_min_attempts']} "
                          f"outgoing attempts (LOP risk — info only, not deducted)")
     cell.font = SECTION_FONT; cell.fill = SECTION_FILL
@@ -491,25 +554,25 @@ def build_evidence_sheet(wb, conn, config, rep_cache, employees, start, end):
                                    f"{na['recovered']} recovered -> {na['final_never_attended']} final"])
 
 
-def build_order_sheet(wb, conn, config, order_detail, order_sources):
+def build_order_sheet(wb, conn, config, order_detail, order_sources, cov, period_label):
     ws = wb.create_sheet("7. Order Attribution")
     ws.column_dimensions["A"].width = 18
     for col in "BCDEFGHIJ":
         ws.column_dimensions[col].width = 15
     ws.column_dimensions["J"].width = 34
     ws.cell(1, 1, "Order Attribution & Incentive Detail").font = TITLE_FONT
+    r = _write_coverage_banner(ws, 2, cov, 10, period_label)
     src_note = ("Source of customer->rep ownership: "
                 + (", ".join(sorted(order_sources)) if order_sources else "none")
                 + ". 'lead_assignment' means the mapping came from who a LEAD was assigned to (a caveat "
                   "source — see Methodology), not a verified sale owner.")
-    ws.cell(2, 1, src_note).font = SUBTITLE_FONT
-
-    ws.cell(3, 1, "Sequence/cumulative use the customer's FULL lifetime order history (the tier is a lifetime "
+    ws.cell(r, 1, src_note).font = SUBTITLE_FONT
+    r += 1
+    ws.cell(r, 1, "Sequence/cumulative use the customer's FULL lifetime order history (the tier is a lifetime "
                   "position). Incentive is only awarded for orders PLACED INSIDE the report period — an order "
                   "from a previous month belongs to that month's payroll. Out-of-period orders are listed for "
                   "audit but award Rs 0.").font = SUBTITLE_FONT
-
-    r = 5
+    r += 2
     r = _write_row(ws, r, ["Salesperson", "Customer Phone", "Order", "Order Date", "In Period?", "Sequence",
                            "Order Value (Rs)", "Cumulative (Rs)", "Incentive (Rs)", "Status"],
                    fonts=[HEAD_FONT] * 10, fill=HEAD_FILL)
@@ -542,11 +605,12 @@ def build_order_sheet(wb, conn, config, order_detail, order_sources):
                   f"Rs {unattr['rev']:,.2f} — earn no incentive until mapped.").font = CELL_FONT
 
 
-def build_methodology_sheet(wb, conn, config, start, end, explicit, period_label):
+def build_methodology_sheet(wb, conn, config, start, end, explicit, period_label, cov):
     ws = wb.create_sheet("8. Methodology & Gaps")
     ws.column_dimensions["A"].width = 30
     ws.column_dimensions["B"].width = 95
     ws.cell(1, 1, "Methodology, Assumptions & Data Gaps").font = TITLE_FONT
+    r0 = _write_coverage_banner(ws, 2, cov, 2, period_label)
 
     calls_n = conn.execute("SELECT COUNT(*) FROM callyzer_calls").fetchone()[0]
     na_n = conn.execute("SELECT COUNT(*) FROM callyzer_never_attended").fetchone()[0]
@@ -597,7 +661,7 @@ def build_methodology_sheet(wb, conn, config, start, end, explicit, period_label
         ("4", "Provide attendance/leave log (decides whether sub-target days are Loss-of-Pay or approved leave)."),
         ("5", "Confirm the customer->salesperson mapping for the handful of customers who actually placed orders."),
     ]
-    r = 3
+    r = r0
     for label, val in rows:
         if val == "":
             cell = ws.cell(r, 1, label); cell.font = SECTION_FONT; cell.fill = SECTION_FILL

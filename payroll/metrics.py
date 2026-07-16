@@ -69,16 +69,31 @@ def _is_excluded_day(date_str, excluded_names):
 
 # ── Core call metrics ────────────────────────────────────────
 
-def call_totals(conn, sim, start, end):
-    """Headline volume/quality counts, straight from callyzer_calls."""
+def call_totals(conn, sim, start, end, excluded_names=()):
+    """Headline volume/quality counts, straight from callyzer_calls.
+
+    active_days counts WORKING days only (excluded weekdays removed), matching
+    the June audit's 'Active = any-activity working days'. Without this a rep
+    who happened to make a call on a Sunday would show one extra active day.
+    connected_45s / talk_seconds cover ALL calls (incoming + outgoing), which
+    is how the June audit defined them — the report states this explicitly so
+    it isn't a hidden assumption."""
+    # SQLite strftime('%w'): 0=Sunday..6=Saturday
+    wmap = {"Sunday": "0", "Monday": "1", "Tuesday": "2", "Wednesday": "3",
+            "Thursday": "4", "Friday": "5", "Saturday": "6"}
+    excl = [wmap[w] for w in excluded_names if w in wmap]
+    excl_clause = ""
+    if excl:
+        in_list = ",".join(f"'{d}'" for d in excl)
+        excl_clause = f"AND strftime('%w', call_timestamp) NOT IN ({in_list})"
     row = conn.execute(
-        """SELECT
+        f"""SELECT
              SUM(CASE WHEN direction='outgoing' THEN 1 ELSE 0 END) AS outgoing,
              SUM(CASE WHEN direction='incoming' THEN 1 ELSE 0 END) AS incoming,
              SUM(CASE WHEN COALESCE(duration_seconds,0) > 45 THEN 1 ELSE 0 END) AS connected_45s,
              SUM(CASE WHEN COALESCE(duration_seconds,0) > 0 THEN 1 ELSE 0 END) AS connected_any,
              COALESCE(SUM(COALESCE(duration_seconds,0)),0) AS talk_seconds,
-             COUNT(DISTINCT date(call_timestamp)) AS active_days,
+             COUNT(DISTINCT CASE WHEN 1=1 {excl_clause} THEN date(call_timestamp) END) AS active_days,
              COUNT(*) AS total
            FROM callyzer_calls
            WHERE rep_sim_number = ? AND date(call_timestamp) BETWEEN ? AND ?""",
@@ -316,3 +331,48 @@ def fmt_talk(seconds):
     seconds = int(seconds or 0)
     h, rem = divmod(seconds, 3600)
     return f"{h}h {rem // 60}m"
+
+
+def data_coverage(conn, start, end):
+    """The actual span + row count of every source feeding the report, so the
+    reader can see exactly what data the numbers rest on (and where a source's
+    period does NOT line up with the report period). Returns a list of dicts
+    with: source, rows, date_from, date_to, aligns (bool or None), note."""
+    def rng(sql):
+        r = conn.execute(sql).fetchone()
+        return r["n"], r["mn"], r["mx"]
+
+    cov = []
+
+    n, mn, mx = rng("SELECT COUNT(*) n, MIN(date(call_timestamp)) mn, MAX(date(call_timestamp)) mx FROM callyzer_calls")
+    cov.append({"source": "Call History (Periodic Call History)", "rows": n, "date_from": mn, "date_to": mx,
+                "aligns": True, "note": "This IS the report period — all performance metrics are built from it."})
+
+    n, mn, mx = rng("SELECT COUNT(*) n, MIN(date(call_timestamp)) mn, MAX(date(call_timestamp)) mx FROM callyzer_never_attended")
+    if n:
+        aligns = not (mx < start or mn > end)
+        cov.append({"source": "Never Attended Report", "rows": n, "date_from": mn, "date_to": mx,
+                    "aligns": aligns,
+                    "note": ("Overlaps the call period — callback recovery computed." if aligns
+                             else "DIFFERENT PERIOD than the call history — only raw missed counts used, "
+                                  "callback recovery NOT computed.")})
+    else:
+        cov.append({"source": "Never Attended Report", "rows": 0, "date_from": None, "date_to": None,
+                    "aligns": None, "note": "Not uploaded."})
+
+    n, mn, mx = rng("SELECT COUNT(*) n, MIN(date(created_date)) mn, MAX(date(created_date)) mx FROM callyzer_leads")
+    cov.append({"source": "Lead Data Report (leads table)", "rows": n, "date_from": mn, "date_to": mx,
+                "aligns": None, "note": "Used for lead assignment / follow-up context."})
+
+    n, mn, mx = rng("SELECT COUNT(*) n, MIN(date(created_at,'localtime')) mn, MAX(date(created_at,'localtime')) mx FROM shopify_orders")
+    cov.append({"source": "Shopify Orders", "rows": n, "date_from": mn, "date_to": mx,
+                "aligns": None, "note": "Full order history kept; only in-period orders earn incentive (see Order Attribution)."})
+
+    n = conn.execute("SELECT COUNT(*) n FROM customer_salesperson_map").fetchone()["n"]
+    n_orders = conn.execute(
+        """SELECT COUNT(DISTINCT m.customer_phone_norm) n FROM customer_salesperson_map m
+           JOIN shopify_orders o ON o.customer_phone_norm = m.customer_phone_norm""").fetchone()["n"]
+    cov.append({"source": "Customer -> Salesperson map", "rows": n, "date_from": None, "date_to": None,
+                "aligns": None, "note": f"{n_orders} of these customers actually have a Shopify order (only those affect payout)."})
+
+    return cov
